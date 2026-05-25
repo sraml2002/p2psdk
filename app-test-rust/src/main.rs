@@ -1,316 +1,392 @@
 //! P2P SDK Rust Demo App
 //!
-//! 通过 C FFI 动态加载 libppsdk.so，复现 ArkTS App (IdsPage2) 的一键连接 + 聊天功能。
-//! Token 嵌入在 libppsdk.so 内部，本程序不处理 token。
+//! 直接依赖 p2p-sdk/p2p-tokio/p2p-core crate，编译为单一可执行文件。
+//! 对标 ArkTS App "P2P Chat"：一键连接 + 聊天。
 
-use std::ffi::{c_char, c_int, CStr, CString};
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use libloading::Library;
+use p2p_core::frame::{encode_heartbeat_reply, parse_frame};
+use p2p_core::ice::agent::HandleDataResult;
+use p2p_core::types::{IceState, TYPE_DATA, TYPE_HEARTBEAT};
+use p2p_io::traits::{Platform, UdpTransport};
+use p2p_sdk::{Config, P2pClient};
+use p2p_tokio::{StdPlatform, SyncHttpTransport, SyncUdpTransport};
 
-// ── C FFI 类型 ─────────────────────────────────────────────────────
+// ── 配置 ─────────────────────────────────────────────────────────────
 
-type CbState = extern "C" fn(*const c_char);
-type CbData = extern "C" fn(*const u8, usize);
-type CbLog = extern "C" fn(*const c_char);
-
-type FnRegisterCallbacks = extern "C" fn(CbState, CbData, CbLog) -> c_int;
-type FnInit = extern "C" fn(*const c_char) -> c_int;
-type FnRegisterIds = extern "C" fn(*const c_char, *const c_char, *const c_char, *const c_char)
-    -> *mut c_char;
-type FnQueryIds = extern "C" fn(*const c_char, *const c_char) -> *mut c_char;
-type FnConnect = extern "C" fn(*const c_char, *const c_char) -> c_int;
-type FnSendText = extern "C" fn(*const c_char) -> c_int;
-type FnClose = extern "C" fn() -> c_int;
-type FnFreeString = extern "C" fn(*mut c_char);
-
-// ── 全局状态（C 回调写入） ─────────────────────────────────────────
-
-static ICE_STATE: Mutex<Option<String>> = Mutex::new(None);
-static DATA_TX: Mutex<Option<mpsc::Sender<String>>> = Mutex::new(None);
-
-extern "C" fn on_state(state: *const c_char) {
-    let s = unsafe { CStr::from_ptr(state) }
-        .to_str()
-        .unwrap_or("")
-        .to_string();
-    eprintln!("[ICE] {}", s);
-    *ICE_STATE.lock().unwrap() = Some(s);
+#[derive(serde::Deserialize)]
+struct AppConfig {
+    #[serde(rename = "idsUrl")]
+    ids_url: String,
+    #[serde(rename = "natUrl")]
+    nat_url: String,
+    #[serde(rename = "appId")]
+    app_id: String,
+    #[serde(rename = "userId")]
+    user_id: String,
+    odid: String,
 }
 
-extern "C" fn on_data(data: *const u8, len: usize) {
-    if len <= 8 {
-        return;
+fn read_config(path: &str) -> AppConfig {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("读取配置失败 '{}': {}", path, e);
+        std::process::exit(1);
+    });
+    serde_json::from_str(&text).unwrap_or_else(|e| {
+        eprintln!("解析配置失败: {}", e);
+        std::process::exit(1);
+    })
+}
+
+// ── 编译时嵌入的 Token（build.rs 加密嵌入，运行时解密） ────────────────
+
+mod embedded_token {
+    include!(concat!(env!("OUT_DIR"), "/embedded_token.rs"));
+
+    pub fn decrypt() -> Option<String> {
+        use sha2::Digest;
+        let seed = format!("p2psdk-embedded-token{}", EMBEDDED_TS);
+        let aes_key = sha2::Sha256::digest(seed.as_bytes());
+
+        let iv_bytes = {
+            let mut iv = [0u8; 12];
+            for i in 0..12 {
+                iv[i] = aes_key[i] ^ aes_key[i + 12] ^ aes_key[i + 20];
+            }
+            iv
+        };
+
+        use aes_gcm::aead::Aead;
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+        let cipher = Aes256Gcm::new_from_slice(&aes_key).ok()?;
+        let nonce = Nonce::from_slice(&iv_bytes);
+        let plain = cipher.decrypt(nonce, EMBEDDED_CIPHER).ok()?;
+        String::from_utf8(plain).ok()
     }
-    let slice = unsafe { std::slice::from_raw_parts(data, len) };
-    // 帧格式: [4B payload len BE][4B frame type BE][payload...]
-    // 心跳帧由 SDK 内部处理（heartbeat_interval=30），此处仅收到 TYPE_DATA
-    let text = String::from_utf8_lossy(&slice[8..]).to_string();
-    if let Some(tx) = DATA_TX.lock().unwrap().as_ref() {
-        let _ = tx.send(text);
-    }
 }
 
-extern "C" fn on_log(msg: *const c_char) {
-    let s = unsafe { CStr::from_ptr(msg) }
-        .to_str()
-        .unwrap_or("");
-    eprintln!("[SDK] {}", s);
+// ── 一键建链 ─────────────────────────────────────────────────────────
+
+struct IceRunner {
+    client: Arc<Mutex<P2pClient>>,
+    udp: Arc<SyncUdpTransport>,
+    stop: Arc<AtomicBool>,
+    data_tx: Sender<String>,
+    state_tx: Sender<IceState>,
+    heartbeat_interval: u64,
 }
 
-// ── P2pApi ─────────────────────────────────────────────────────────
+impl IceRunner {
+    /// 一键连接：resolve NAT → gather candidates → SDP negotiate → 启动 ICE 线程
+    fn connect(
+        token: &str,
+        config: &AppConfig,
+        peer_addr: &str,
+        data_tx: Sender<String>,
+        state_tx: Sender<IceState>,
+    ) -> Result<Self, String> {
+        let http = SyncHttpTransport::new();
+        let platform = StdPlatform::new();
 
-struct P2pApi {
-    register_callbacks: FnRegisterCallbacks,
-    init: FnInit,
-    register_ids: FnRegisterIds,
-    query_ids: FnQueryIds,
-    connect: FnConnect,
-    send_text: FnSendText,
-    close: FnClose,
-    free_string: FnFreeString,
-}
+        let mut client = P2pClient::new();
+        client.init(Config {
+            ids_url: config.ids_url.clone(),
+            nat_url: config.nat_url.clone(),
+            app_id: config.app_id.clone(),
+        });
 
-fn load_api(path: &str) -> P2pApi {
-    let lib = unsafe {
-        Library::new(path).unwrap_or_else(|e| {
-            eprintln!("加载 {} 失败: {e}", path);
-            eprintln!("用法: app-test-rust <config.json> [libppsdk.so]");
-            std::process::exit(1);
-        })
-    };
-    let api = unsafe {
-        P2pApi {
-            register_callbacks: *lib
-                .get(b"ppsdk_register_callbacks\0")
-                .expect("ppsdk_register_callbacks 未找到"),
-            init: *lib.get(b"ppsdk_init\0").expect("ppsdk_init 未找到"),
-            register_ids: *lib
-                .get(b"ppsdk_register_ids\0")
-                .expect("ppsdk_register_ids 未找到"),
-            query_ids: *lib
-                .get(b"ppsdk_query_ids\0")
-                .expect("ppsdk_query_ids 未找到"),
-            connect: *lib.get(b"ppsdk_connect\0").expect("ppsdk_connect 未找到"),
-            send_text: *lib
-                .get(b"ppsdk_send_text\0")
-                .expect("ppsdk_send_text 未找到"),
-            close: *lib.get(b"ppsdk_close\0").expect("ppsdk_close 未找到"),
-            free_string: *lib
-                .get(b"ppsdk_free_string\0")
-                .expect("ppsdk_free_string 未找到"),
+        // 获取 STUN/TURN 服务器地址
+        client.resolve_nat_route(&http, token)?;
+
+        // 绑定 UDP + 收集候选 + 创建 IceAgent
+        let udp = SyncUdpTransport::bind_any(0)
+            .map_err(|e| format!("UDP bind 失败: {}", e))?;
+        client.setup_ice_and_gather(&udp, &platform, token, true)?;
+
+        // 获取 default IP/port 用于 SDP offer
+        let (default_ip, default_port) = udp.local_addr()
+            .map_err(|e| format!("获取本地地址失败: {}", e))?;
+        let local_addrs = platform.get_local_addresses();
+        let default_ip = local_addrs
+            .iter()
+            .find(|a| *a != "127.0.0.1" && *a != "::1")
+            .cloned()
+            .unwrap_or(default_ip);
+
+        let client = Arc::new(Mutex::new(client));
+        let udp = Arc::new(udp);
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let runner = Self {
+            client: client.clone(),
+            udp: udp.clone(),
+            stop: stop.clone(),
+            data_tx,
+            state_tx,
+            heartbeat_interval: 30,
+        };
+
+        // SDP 交换 + start_checks
+        {
+            let mut c = runner.client.lock().unwrap();
+            c.connect_via_sdp(&http, &config.odid, peer_addr, &default_ip, default_port)?;
         }
-    };
-    // 防止 Library 被 drop 导致 .so 卸载
-    std::mem::forget(lib);
-    api
-}
 
-// 辅助: 调用返回 *mut c_char 的函数，转换为 String 后自动释放
-fn call_string_fn(f: impl FnOnce() -> *mut c_char, api: &P2pApi) -> Option<String> {
-    let ptr = f();
-    if ptr.is_null() {
-        return None;
+        // 启动 tick 和 recv 线程
+        runner.start_tick_thread();
+        runner.start_recv_thread();
+
+        Ok(runner)
     }
-    let s = unsafe { CStr::from_ptr(ptr) }
-        .to_str()
-        .ok()
-        .map(|s| s.to_string());
-    (api.free_string)(ptr);
-    s
+
+    fn start_tick_thread(&self) {
+        let client = self.client.clone();
+        let udp = self.udp.clone();
+        let stop = self.stop.clone();
+        let state_tx = self.state_tx.clone();
+        let heartbeat_interval = self.heartbeat_interval;
+
+        thread::spawn(move || {
+            let mut now_ms: u64 = 0;
+            let mut last_state: Option<IceState> = None;
+            let mut last_hb_ms: u64 = 0;
+
+            while !stop.load(Ordering::Relaxed) {
+                let actions = {
+                    let mut c = client.lock().unwrap();
+                    let actions = c.tick(now_ms);
+
+                    // 检测 ICE 状态变化
+                    if let Some(state) = c.ice_state() {
+                        if last_state != Some(state) {
+                            let _ = state_tx.send(state);
+                            last_state = Some(state);
+                        }
+                    }
+
+                    actions
+                };
+
+                for act in &actions {
+                    let _ = udp.send_to(&act.data, &act.target_ip, act.target_port);
+                }
+
+                // 心跳
+                if heartbeat_interval > 0 && last_state == Some(IceState::Completed) {
+                    let elapsed = now_ms.saturating_sub(last_hb_ms);
+                    if elapsed >= heartbeat_interval * 1000 {
+                        let hb = encode_heartbeat_reply();
+                        let c = client.lock().unwrap();
+                        if let Some(act) = c.send_data(&hb) {
+                            let _ = udp.send_to(&act.data, &act.target_ip, act.target_port);
+                        }
+                        last_hb_ms = now_ms;
+                    }
+                }
+
+                now_ms += 50;
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+    }
+
+    fn start_recv_thread(&self) {
+        let client = self.client.clone();
+        let udp = self.udp.clone();
+        let stop = self.stop.clone();
+        let data_tx = self.data_tx.clone();
+        let heartbeat_interval = self.heartbeat_interval;
+
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let (data, from_ip, from_port): (Vec<u8>, String, u16) = match udp.recv_from(200) {
+                    Ok(result) => result,
+                    Err(_) => continue,
+                };
+
+                let HandleDataResult { app_data, actions } = {
+                    let mut c = client.lock().unwrap();
+                    c.handle_incoming_udp(&data, &from_ip, from_port)
+                };
+
+                for act in &actions {
+                    let _ = udp.send_to(&act.data, &act.target_ip, act.target_port);
+                }
+
+                if let Some(payload) = app_data {
+                    if heartbeat_interval > 0 {
+                        // 心跳帧自动回复
+                        if let Some(frame) = parse_frame(&payload) {
+                            if frame.frame_type == TYPE_HEARTBEAT {
+                                let hb = encode_heartbeat_reply();
+                                let c = client.lock().unwrap();
+                                if let Some(act) = c.send_data(&hb) {
+                                    let _ = udp.send_to(&act.data, &act.target_ip, act.target_port);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+
+                    // 数据帧 → 传递给主线程
+                    if let Some(frame) = P2pClient::parse_received(&payload) {
+                        if frame.frame_type == TYPE_DATA {
+                            let text = String::from_utf8_lossy(&frame.payload).to_string();
+                            let _ = data_tx.send(text);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn send_text(&self, text: &str) -> Result<(), String> {
+        let act = {
+            let c = self.client.lock().unwrap();
+            c.send_text(text).ok_or_else(|| "连接未建立".to_string())?
+        };
+        self.udp
+            .send_to(&act.data, &act.target_ip, act.target_port)
+            .map_err(|e| format!("发送失败: {}", e))
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let mut c = self.client.lock().unwrap();
+        c.stop_ice();
+    }
 }
 
-fn is_connected() -> bool {
-    ICE_STATE
-        .lock()
-        .unwrap()
-        .as_deref()
-        == Some("COMPLETED")
-}
-
-// ── Main ───────────────────────────────────────────────────────────
+// ── 主流程 ───────────────────────────────────────────────────────────
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let config_path = args.get(1).map(|s| s.as_str()).unwrap_or("config.json");
-    let lib_path = {
-        let raw = args.get(2).map(|s| s.as_str()).unwrap_or("libppsdk.so");
-        // dlopen 不搜索当前目录，补 ./ 前缀确保可从当前目录加载
-        if !raw.starts_with('/') && !raw.starts_with("./") {
-            format!("./{raw}")
-        } else {
-            raw.to_string()
-        }
-    };
 
-    // 1. 加载 libppsdk.so
-    let api = load_api(&lib_path);
+    let config = read_config(config_path);
 
-    // 2. 注册 C 回调
-    (api.register_callbacks)(on_state, on_data, on_log);
+    // 解密编译时嵌入的 Token
+    let token = embedded_token::decrypt().unwrap_or_else(|| {
+        eprintln!("嵌入 Token 解密失败");
+        std::process::exit(1);
+    });
+    let http = SyncHttpTransport::new();
 
-    // 3. 读取配置
-    let config_text = match std::fs::read_to_string(config_path) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("读取配置失败: {e}");
-            std::process::exit(1);
-        }
-    };
-    let config: serde_json::Value =
-        serde_json::from_str(&config_text).unwrap_or_else(|e| {
-            eprintln!("解析配置失败: {e}");
+    // 初始化 P2pClient（仅用于 register/query）
+    let mut client = P2pClient::new();
+    client.init(Config {
+        ids_url: config.ids_url.clone(),
+        nat_url: config.nat_url.clone(),
+        app_id: config.app_id.clone(),
+    });
+
+    // Step 1: 注册 IDS
+    print!("[1/3] 注册 IDS...");
+    io::stdout().flush().ok();
+    client
+        .register_ids(&http, &config.user_id, &config.odid, "")
+        .map_err(|e| format!("失败: {}", e))
+        .unwrap();
+    println!(" 成功");
+
+    // Step 2: 查询 IDS
+    print!("[2/3] 查询 IDS...");
+    io::stdout().flush().ok();
+    let peer = client
+        .query_ids(&http, &config.user_id)
+        .map_err(|e| format!("失败: {}", e))
+        .unwrap();
+    if peer.token.is_empty() {
+        eprintln!(" 未找到对端 service 记录");
+        std::process::exit(1);
+    }
+    println!(" 找到对端: {}", peer.token);
+
+    // Step 3: 一键建链
+    print!("[3/3] 建立 P2P 连接...");
+    io::stdout().flush().ok();
+
+    let (data_tx, data_rx) = mpsc::channel::<String>();
+    let (state_tx, state_rx) = mpsc::channel::<IceState>();
+
+    let runner = IceRunner::connect(&token, &config, &peer.token, data_tx, state_tx)
+        .unwrap_or_else(|e| {
+            eprintln!(" 失败: {}", e);
             std::process::exit(1);
         });
 
-    // 4. init
-    let config_c = CString::new(config_text.clone()).unwrap();
-    let code = (api.init)(config_c.as_ptr());
-    if code != 0 {
-        eprintln!("init 失败: {code}");
-        std::process::exit(1);
-    }
-    println!("[Demo] SDK 已初始化");
+    println!(" 等待 ICE 协商...");
 
-    let app_id = config["appId"].as_str().unwrap_or("");
-    let user_id = config["userId"].as_str().unwrap_or("");
-    let odid = config["odid"].as_str().unwrap_or("");
-
-    // 5. registerIds
-    let app_id_c = CString::new(app_id).unwrap();
-    let user_id_c = CString::new(user_id).unwrap();
-    let odid_c = CString::new(odid).unwrap();
-    let empty_c = CString::new("").unwrap();
-
-    print!("[1/3] 注册 IDS...");
-    io::stdout().flush().ok();
-    let resp = call_string_fn(
-        || {
-            (api.register_ids)(
-                app_id_c.as_ptr(),
-                user_id_c.as_ptr(),
-                odid_c.as_ptr(),
-                empty_c.as_ptr(),
-            )
-        },
-        &api,
-    );
-    match resp {
-        Some(ref s) if !s.contains("error") => println!(" 成功"),
-        Some(ref s) => {
-            println!(" 失败: {}", s);
-            std::process::exit(1);
-        }
-        None => {
-            println!(" 失败");
-            std::process::exit(1);
-        }
-    }
-
-    // 6. queryIds
-    print!("[2/3] 查询 IDS...");
-    io::stdout().flush().ok();
-    let resp = call_string_fn(
-        || (api.query_ids)(app_id_c.as_ptr(), user_id_c.as_ptr()),
-        &api,
-    );
-    let peer_id = match resp {
-        Some(ref s) => {
-            let json: serde_json::Value = serde_json::from_str(s).unwrap_or_default();
-            let data = json.get("data").and_then(|d| d.as_array());
-            let token = data
-                .and_then(|arr| {
-                    arr.iter()
-                        .find(|r| r.get("type").and_then(|v| v.as_str()) == Some("service"))
-                        .and_then(|r| r.get("token").and_then(|v| v.as_str()))
-                })
-                .unwrap_or("");
-            if token.is_empty() {
-                println!(" 失败: 未获取到对端地址");
-                std::process::exit(1);
+    // 等待 ICE 完成
+    let connected = loop {
+        match state_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(state) => {
+                println!("[ICE] {}", state);
+                if state == IceState::Completed || state == IceState::Connected {
+                    break true;
+                }
+                if state == IceState::Failed {
+                    break false;
+                }
             }
-            println!(" 成功 (对端: {})", token);
-            token.to_string()
-        }
-        None => {
-            println!(" 失败");
-            std::process::exit(1);
+            Err(_) => {
+                eprintln!("[ICE] 协商超时");
+                break false;
+            }
         }
     };
 
-    // 7. connect
-    println!("[3/3] 建立 P2P 连接...");
-    let peer_id_c = CString::new(peer_id).unwrap();
-    let code = (api.connect)(peer_id_c.as_ptr(), odid_c.as_ptr());
-    if code != 0 {
-        eprintln!("连接失败: {code}");
+    if !connected {
+        runner.stop();
         std::process::exit(1);
     }
 
-    // 8. 聊天事件循环
-    chat_loop(&api);
-}
+    // 聊天循环
+    println!("已连接，输入消息按回车发送，/quit 退出\n");
 
-fn chat_loop(api: &P2pApi) {
-    let (data_tx, data_rx) = mpsc::channel::<String>();
-    *DATA_TX.lock().unwrap() = Some(data_tx);
-
-    let (stdin_tx, stdin_rx) = mpsc::channel::<String>();
     let running = Arc::new(AtomicBool::new(true));
-    let running_clone = running.clone();
 
-    // stdin 读取线程
-    thread::spawn(move || {
-        let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            match line {
-                Ok(text) => {
-                    if stdin_tx.send(text).is_err() {
-                        break;
+    // stdin 线程
+    let (stdin_tx, stdin_rx): (Sender<String>, Receiver<String>) = mpsc::channel();
+    {
+        let running_clone = running.clone();
+        thread::spawn(move || {
+            let stdin = io::stdin();
+            for line in stdin.lock().lines() {
+                match line {
+                    Ok(text) => {
+                        if stdin_tx.send(text).is_err() {
+                            break;
+                        }
                     }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
-        }
-        running_clone.store(false, Ordering::Relaxed);
-    });
-
-    println!("[Demo] 连接中...");
-    println!("[Demo] 输入消息按回车发送, /quit 退出, /status 查看状态");
+            running_clone.store(false, Ordering::Relaxed);
+        });
+    }
 
     while running.load(Ordering::Relaxed) {
         // 用户输入
         while let Ok(text) = stdin_rx.try_recv() {
             match text.as_str() {
                 "/quit" => {
-                    println!("[Demo] 正在退出...");
+                    println!("正在退出...");
                     running.store(false, Ordering::Relaxed);
                 }
                 "/status" => {
-                    let state = ICE_STATE
-                        .lock()
-                        .unwrap()
-                        .clone()
-                        .unwrap_or_else(|| "无".into());
-                    println!("[状态] ICE: {}", state);
+                    let state = runner.client.lock().unwrap().ice_state();
+                    println!("[状态] ICE: {}", state.map(|s| s.to_string()).unwrap_or("无".into()));
                 }
-                _ => {
-                    if is_connected() {
-                        let text_c = CString::new(text.clone()).unwrap();
-                        let code = (api.send_text)(text_c.as_ptr());
-                        if code == 0 {
-                            println!("[我] {}", text);
-                        } else {
-                            eprintln!("[错误] 发送失败: {}", code);
-                        }
-                    } else {
-                        eprintln!("[警告] 连接未建立, 无法发送");
-                    }
-                }
+                _ => match runner.send_text(&text) {
+                    Ok(()) => println!("[我] {}", text),
+                    Err(e) => eprintln!("[错误] {}", e),
+                },
             }
         }
 
@@ -322,6 +398,6 @@ fn chat_loop(api: &P2pApi) {
         thread::sleep(Duration::from_millis(100));
     }
 
-    (api.close)();
-    println!("[Demo] 已退出");
+    runner.stop();
+    println!("已退出");
 }

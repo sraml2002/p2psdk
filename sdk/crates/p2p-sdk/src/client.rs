@@ -94,28 +94,67 @@ impl P2pClient {
     // ── NAT route resolution ────────────────────────────────────────────────
 
     /// Fetch NAT route info (STUN/TURN server addresses) from the route service.
+    ///
+    /// Failures are non-fatal: if STUN/TURN queries fail, empty values are stored
+    /// and ICE will proceed with host candidates only.
     pub fn resolve_nat_route(
         &mut self,
         http: &dyn HttpTransport,
         p2p_token: &str,
     ) -> Result<(), String> {
         let config = self.config.as_ref().ok_or("not initialized")?;
-        let url = format!("{}/api/nat/route", config.nat_url);
-        let headers = vec![("Content-Type".into(), "application/json".into())];
-        let body = serde_json::json!({ "token": p2p_token });
-        let body_bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
-        let (status, resp) = http.post(&url, &headers, &body_bytes).map_err(|e| format!("HTTP: {e}"))?;
-        if !(200..300).contains(&status) {
-            return Err(format!("NAT route failed: HTTP {status}"));
+        if config.nat_url.is_empty() {
+            return Ok(());
         }
-        let env: serde_json::Value = serde_json::from_str(&resp).map_err(|e| e.to_string())?;
-        let data = env.get("data").ok_or("missing data field")?;
-        self.nat_route = Some(NatRoute {
-            stun_ip: data["stunIp"].as_str().unwrap_or("").into(),
-            stun_port: data["stunPort"].as_u64().unwrap_or(0) as u16,
-            turn_ip: data["turnIp"].as_str().unwrap_or("").into(),
-            turn_port: data["turnPort"].as_u64().unwrap_or(0) as u16,
-        });
+        let url = &config.nat_url;
+        let headers = vec![
+            ("Content-Type".into(), "application/json".into()),
+            ("Authorization".into(), p2p_token.into()),
+        ];
+
+        let parse_port = |v: Option<&serde_json::Value>| -> u16 {
+            v.and_then(|v| {
+                v.as_u64().map(|n| n as u16)
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<u16>().ok()))
+            }).unwrap_or(0)
+        };
+
+        let mut stun_ip = String::new();
+        let mut stun_port: u16 = 0;
+        let mut turn_ip = String::new();
+        let mut turn_port: u16 = 0;
+
+        // STUN (type=2) — failure is non-fatal
+        let stun_body = serde_json::json!({ "type": 2 });
+        if let Ok(body_bytes) = serde_json::to_vec(&stun_body) {
+            match http.post(url, &headers, &body_bytes) {
+                Ok((status, resp)) if (200..300).contains(&status) => {
+                    let json: serde_json::Value = serde_json::from_str(&resp).unwrap_or_default();
+                    let data = json.get("data").unwrap_or(&json);
+                    stun_ip = data.get("stunIp").and_then(|v| v.as_str()).unwrap_or("").into();
+                    stun_port = parse_port(data.get("stunPort"));
+                }
+                Ok((status, _)) => eprintln!("NAT STUN: HTTP {status}"),
+                Err(e) => eprintln!("NAT STUN: {e}"),
+            }
+        }
+
+        // TURN (type=3) — failure is non-fatal
+        let turn_body = serde_json::json!({ "type": 3 });
+        if let Ok(body_bytes) = serde_json::to_vec(&turn_body) {
+            match http.post(url, &headers, &body_bytes) {
+                Ok((status, resp)) if (200..300).contains(&status) => {
+                    let json: serde_json::Value = serde_json::from_str(&resp).unwrap_or_default();
+                    let data = json.get("data").unwrap_or(&json);
+                    turn_ip = data.get("turnIp").and_then(|v| v.as_str()).unwrap_or("").into();
+                    turn_port = parse_port(data.get("turnPort"));
+                }
+                Ok((status, _)) => eprintln!("NAT TURN: HTTP {status}"),
+                Err(e) => eprintln!("NAT TURN: {e}"),
+            }
+        }
+
+        self.nat_route = Some(NatRoute { stun_ip, stun_port, turn_ip, turn_port });
         Ok(())
     }
 
@@ -507,14 +546,17 @@ impl P2pClient {
     // ── SDP-based connection ────────────────────────────────────────────────
 
     /// Connect via SDP offer/answer over HTTP.
+    ///
+    /// `peer_addr` is the signaling URL from IDS (e.g. "81.71.29.250:34848").
+    /// Posts raw SDP to `http://{peer_addr}/api/ice/offer`.
     pub fn connect_via_sdp(
         &mut self,
         http: &dyn HttpTransport,
         odid: &str,
-        peer_id: &str,
+        peer_addr: &str,
         default_ip: &str,
         default_port: u16,
-    ) -> Result<String, String> {
+    ) -> Result<(), String> {
         let agent = self.ice_agent.as_mut().ok_or("no ICE agent")?;
         let desc = agent.local_session_description();
         let sdp_offer = generate_sdp_offer(
@@ -526,9 +568,8 @@ impl P2pClient {
             default_port,
         );
 
-        let config = self.config.as_ref().ok_or("not initialized")?;
-        let resp = ids::send_ice_offer(http, &config.ids_url, peer_id, &sdp_offer)?;
-        let answer = parse_sdp_answer(&resp.sdp);
+        let sdp_answer = ids::send_ice_offer(http, peer_addr, &sdp_offer)?;
+        let answer = parse_sdp_answer(&sdp_answer);
 
         let remote_desc = p2p_core::types::IceSessionDescription {
             ice_ufrag: answer.ufrag,
@@ -539,7 +580,7 @@ impl P2pClient {
         agent.set_remote_session_description(&remote_desc);
         agent.start_checks()?;
 
-        Ok(resp.status)
+        Ok(())
     }
 
     // ── ICE data flow ──────────────────────────────────────────────────────

@@ -17,12 +17,6 @@ pub struct IdsRecord {
     pub token: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct IceOfferResponse {
-    pub sdp: String,
-    pub status: String,
-}
-
 // ---------------------------------------------------------------------------
 // API functions
 // ---------------------------------------------------------------------------
@@ -37,7 +31,7 @@ pub fn register_ids(
     odid: &str,
     token: &str,
 ) -> Result<(), String> {
-    let url = format!("http://{host}/api/ids");
+    let url = format!("{host}/api/ids");
     let body = serde_json::json!({
         "appId": app_id,
         "userId": user_id,
@@ -69,7 +63,7 @@ pub fn query_ids(
     app_id: &str,
     user_id: &str,
 ) -> Result<IdsRecord, String> {
-    let url = format!("http://{host}/api/ids/{app_id}/{user_id}");
+    let url = format!("{host}/api/ids/{app_id}/{user_id}");
     let headers = headers();
     let (status, resp) = http.get(&url, &headers).map_err(|e| format!("HTTP: {e}"))?;
     if !(200..300).contains(&status) {
@@ -94,29 +88,26 @@ pub fn query_ids(
         .ok_or_else(|| "No service record found in IDS".into())
 }
 
-/// Send an SDP offer to the ICE service.
+/// Send an SDP offer to the peer's ICE service.
+///
+/// Posts raw SDP text to `http://{peer_addr}/api/ice/offer` and returns the SDP answer.
 pub fn send_ice_offer(
     http: &dyn HttpTransport,
-    base_url: &str,
-    peer_id: &str,
+    peer_addr: &str,
     sdp_offer: &str,
-) -> Result<IceOfferResponse, String> {
-    let url = format!("http://{base_url}/api/ice/offer/{peer_id}");
-    let body = serde_json::json!({ "sdp": sdp_offer });
-    let body_bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
-    let headers = headers();
-    let (status, resp) = http.post(&url, &headers, &body_bytes).map_err(|e| format!("HTTP: {e}"))?;
+) -> Result<String, String> {
+    let url = format!("http://{peer_addr}/api/ice/offer");
+    let headers = vec![("Content-Type".into(), "application/sdp".into())];
+    let (status, resp) = http.post(&url, &headers, sdp_offer.as_bytes())
+        .map_err(|e| format!("HTTP: {e}"))?;
     if !(200..300).contains(&status) {
         return Err(format!("ICE offer failed: HTTP {status}"));
     }
-
-    #[derive(serde::Deserialize)]
-    struct Envelope {
-        sdp: String,
-        status: String,
+    let answer = resp.trim().to_string();
+    if answer.is_empty() {
+        return Err("ICE offer: empty SDP answer".into());
     }
-    let env: Envelope = serde_json::from_str(&resp).map_err(|e| e.to_string())?;
-    Ok(IceOfferResponse { sdp: env.sdp, status: env.status })
+    Ok(answer)
 }
 
 fn headers() -> Vec<(String, String)> {
@@ -138,12 +129,5 @@ mod tests {
         assert_eq!(rec.appId, "a");
         assert_eq!(rec.type_, "service");
         assert_eq!(rec.token, "t");
-    }
-
-    #[test]
-    fn test_ice_offer_response_deserialize() {
-        let json = r#"{"sdp":"v=0...","status":"connected"}"#;
-        let resp: IceOfferResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.status, "connected");
     }
 }

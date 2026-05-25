@@ -10,7 +10,7 @@ function buildRustSoPlugin(): HvigorPlugin {
       currentNode.registerTask({
         name: 'BuildRustSo',
         run(): void {
-          const scriptPath: string = path.resolve(__dirname, '..', '..', 'build-so.sh')
+          const scriptPath: string = path.resolve(__dirname, '..', '..', 'build-arkts-napi-so.sh')
           console.log(`[BuildRustSo] Executing: ${scriptPath}`)
           try {
             execSync(`bash "${scriptPath}"`, { stdio: 'inherit' })

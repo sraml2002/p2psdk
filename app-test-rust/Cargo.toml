@@ -4,6 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-libloading = "0.8"
+p2p-sdk = { path = "../sdk/crates/p2p-sdk" }
+p2p-tokio = { path = "../sdk/crates/p2p-tokio" }
+p2p-core = { path = "../sdk/crates/p2p-core" }
+p2p-io = { path = "../sdk/crates/p2p-io" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+aes-gcm = "0.10"
+
+[build-dependencies]
+sha2 = "0.10"
+aes-gcm = "0.10"

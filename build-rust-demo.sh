@@ -4,51 +4,79 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SDK_DIR="$SCRIPT_DIR/sdk"
 DEMO_DIR="$SCRIPT_DIR/app-test-rust"
-TARGET="aarch64-unknown-linux-ohos"
-TOKEN_FILE="$SDK_DIR/crates/p2p-napi/build.jwt.nogit"
-DIST_DIR="$SCRIPT_DIR/app-test-rust/dist"
+DIST_DIR="$DEMO_DIR/dist"
 
-export PATH="$HOME/.cargo/bin:$PATH"
+OHOS_TARGET="aarch64-unknown-linux-ohos"
 
 # 解析参数
-NO_SO=0
+TARGET="$OHOS_TARGET"
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --token) echo "$2" > "$TOKEN_FILE"; shift 2 ;;
-    --no-so) NO_SO=1; shift ;;
-    *) echo "Unknown option: $1"; exit 1 ;;
+    --target) TARGET="$2"; shift 2 ;;
+    *) echo "Unknown option: $1"; echo "Usage: $0 [--target <triple>]"; exit 1 ;;
   esac
 done
 
-# ── 构建 libppsdk.so ─────────────────────────────────────────────
-if [[ "$NO_SO" -eq 0 ]]; then
-  if [[ ! -f "$TOKEN_FILE" ]] || [[ "$(tr -d '[:space:]' < "$TOKEN_FILE")" == "change-me-to-valid-jwt-token" ]]; then
-    echo "ERROR: $TOKEN_FILE missing or placeholder. Use --token <JWT> to set."
-    exit 1
-  fi
-  echo "[1/2] Building libppsdk.so..."
-  cd "$SDK_DIR"
-  cargo build -p ppsdk --release --target "$TARGET"
+if [[ "$TARGET" == "$OHOS_TARGET" ]]; then
+  TARGET_LABEL="OHOS ($OHOS_TARGET)"
+  CARGO_TARGET_FLAG="--target $OHOS_TARGET"
+  # 交叉编译需要 OHOS NDK 链接器配置
+  mkdir -p "$DEMO_DIR/.cargo"
+  cp "$SDK_DIR/.cargo/config.toml" "$DEMO_DIR/.cargo/config.toml"
+else
+  TARGET_LABEL="macOS (native)"
+  CARGO_TARGET_FLAG=""
 fi
 
-# ── 构建 app-test-rust ───────────────────────────────────────────
-echo "[2/2] Building app-test-rust..."
-cd "$DEMO_DIR"
-cargo build --release --target "$TARGET"
+echo "=========================================="
+echo "Building app-test-rust ($TARGET_LABEL)..."
+echo "=========================================="
 
-# ── 收集产物 ─────────────────────────────────────────────────────
+cd "$DEMO_DIR"
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo build --release $CARGO_TARGET_FLAG 2>&1
+
+# 清理并创建输出目录
 rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR"
-cp "$SDK_DIR/target/$TARGET/release/libppsdk.so" "$DIST_DIR/"
-cp "$DEMO_DIR/target/$TARGET/release/app-test-rust" "$DIST_DIR/"
-cp "$DEMO_DIR/config.example.json" "$DIST_DIR/config.example.json"
+
+# 复制可执行文件
+if [[ "$TARGET" == "$OHOS_TARGET" ]]; then
+  BIN_PATH="$DEMO_DIR/target/$OHOS_TARGET/release/app-test-rust"
+else
+  BIN_PATH="$DEMO_DIR/target/release/app-test-rust"
+fi
+
+if [[ -f "$BIN_PATH" ]]; then
+  cp "$BIN_PATH" "$DIST_DIR/"
+elif [[ -f "${BIN_PATH}.exe" ]]; then
+  cp "${BIN_PATH}.exe" "$DIST_DIR/"
+fi
+
+# 复制配置样例
+cp "$DEMO_DIR/config.example.json" "$DIST_DIR/"
 
 echo ""
-echo "Done! Output:"
+echo "=========================================="
+echo "Build completed! ($TARGET_LABEL)"
+echo "=========================================="
+echo "Output: $DIST_DIR/"
 ls -lh "$DIST_DIR/"
-echo ""
-echo "Deploy and run:"
-echo "  hdc file send $DIST_DIR/libppsdk.so /data/local/tmp/"
-echo "  hdc file send $DIST_DIR/app-test-rust /data/local/tmp/"
-echo "  hdc file send config.json /data/local/tmp/"
-echo '  hdc shell "cd /data/local/tmp && chmod +x app-test-rust && ./app-test-rust config.json ./libppsdk.so"'
+
+if [[ "$TARGET" == "$OHOS_TARGET" ]]; then
+  echo ""
+  echo "Deploy to device:"
+  echo "  hdc file send $DIST_DIR/app-test-rust /data/local/tmp/"
+  echo "  hdc file send $DIST_DIR/config.example.json /data/local/tmp/"
+  echo "  hdc shell chmod +x /data/local/tmp/app-test-rust"
+  echo ""
+  echo "Run on device:"
+  echo "  1. hdc shell"
+  echo "  2. cd /data/local/tmp && cp config.example.json config.json && vi config.json"
+  echo "  3. ./app-test-rust config.json"
+else
+  echo ""
+  echo "Usage:"
+  echo "  cd $DIST_DIR && cp config.example.json config.json && edit config.json"
+  echo "  ./app-test-rust config.json"
+fi

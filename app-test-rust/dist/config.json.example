@@ -1,7 +1,0 @@
-{
-  "idsUrl": "{ids服务url}",
-  "natUrl": "{nat服务url}",
-  "appId": "{宿主AppId}",
-  "userId": "{宿主用户ID}",
-  "odid": "{宿主App ODID}"
-}

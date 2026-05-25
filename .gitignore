@@ -1,5 +1,8 @@
 # Rust
 sdk/target/
+app-test-rust/target/
+app-test-rust/dist/
+app-test-rust/.cargo/
 
 # HarmonyOS build
 app-test-hmos/.cxx/

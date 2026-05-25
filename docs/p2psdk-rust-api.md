@@ -1,453 +1,31 @@
 # P2P SDK (Rust) — API 参考文档
 
-> 最后更新: 2026-05-18
+> 最后更新: 2026-05-25
 
 ---
 
-## 第一部分：ArkTS 调用接口（面向鸿蒙 Next App）
+## 第一部分：Rust Crate 接口（面向 Rust 开发者）
 
-App 通过 `import ppsdk from 'libppsdk.so'` 直接调用所有 SDK 功能，无需 ETS 封装层。类型声明由 `cpp/types/libppsdk/index.d.ts` 提供。
+### 公开接口总览
 
-```typescript
-import ppsdk from 'libppsdk.so'
+`P2pClient` 是高层 SDK 入口，编排 ICE/STUN/TURN/IDS 全流程。
 
-// 初始化
-ppsdk.init(JSON.stringify({ idsUrl: '...', natUrl: '...' }))
-```
-
-> **ArkTS 严格模式注意**：`ppsdk` 返回值为 `any`，接收返回值的变量必须显式标注类型。
-
-### 1.1 初始化
-
-##### `init(configJson: string): number`
-
-传入 JSON 字符串形式的配置，初始化 SDK。
-
-**参数**：
-
-| 参数 | 类型 | 必选 | 说明 |
-|------|------|------|------|
-| configJson | string | 是 | JSON 字符串，字段见下表 |
-
-**configJson 字段**：
-
-| 字段 | 类型 | 说明 |
+| 方法 | 签名 | 说明 |
 |------|------|------|
-| idsUrl | string | IDS 服务地址（`host:port`） |
-| natUrl | string | NAT 路由服务 URL |
-
-**返回值**：`0` = 成功，负值 = 失败
-
-```typescript
-ppsdk.init(JSON.stringify({
-  idsUrl: 'ids-host:port',
-  natUrl: 'https://natservice...',
-}))
-```
-
----
-
-### 1.2 IDS 注册
-
-##### `registerIds(appId: string, userId: string, odid: string, pushToken: string): IdsResponse`
-
-向 IDS 服务注册本端信息。**同步阻塞 HTTP 调用**（10s 超时）。
-
-**参数**：
-
-| 参数 | 类型 | 必选 | 说明 |
-|------|------|------|------|
-| appId | string | 是 | 应用 ID |
-| userId | string | 是 | 用户 ID |
-| odid | string | 是 | 本端设备标识 |
-| pushToken | string | 是 | 推送 Token |
-
-**返回值**：`IdsResponse`
-
-**IdsResponse**:
-
-| 属性 | 类型 | 说明 |
-|------|------|------|
-| `code` | `number` | 响应码 |
-| `message` | `string` | 响应消息 |
-| `error` | `string \| undefined` | 错误信息（仅失败时存在） |
-| `data` | `IdsRecord[] \| undefined` | 记录数组（可能不存在） |
-
-**IdsRecord**:
-
-| 属性 | 类型 | 说明 |
-|------|------|------|
-| `appId` | `string` | 应用 ID |
-| `userId` | `string` | 用户 ID |
-| `type` | `string` | 记录类型（`'app'`、`'service'` 等） |
-| `odid` | `string` | 设备 ODID |
-| `token` | `string` | 信令地址或 Push Token |
-
-```typescript
-const resp: IdsResponse = ppsdk.registerIds(appId, userId, odid, pushToken)
-if (resp.error !== undefined && resp.error.length > 0) {
-  // 注册失败
-} else {
-  // 注册成功
-}
-```
+| `P2pClient::new()` | `-> Self` | 创建 P2pClient 实例 |
+| `init` | `(&mut self, config: &P2pConfig)` | 初始化 SDK 配置 |
+| `register_ids` | `(&self, http, app_id, user_id, odid, push_token) -> Result<IdsResponse, String>` | 向 IDS 注册本端信息 |
+| `query_ids` | `(&self, http, app_id, user_id) -> Result<IdsResponse, String>` | 查询 IDS 获取对端信息 |
+| `send_text` | `(&self, text: &str) -> Option<IceAction>` | 通过 P2P 通道发送文本 |
+| `send_data` | `(&self, data: &[u8]) -> Option<IceAction>` | 通过 P2P 通道发送二进制数据 |
+| `handle_incoming_udp` | `(&mut self, data, from_ip, from_port) -> HandleDataResult` | 处理收到的 UDP 数据，返回应用层数据 |
+| `parse_received` | `(data: &[u8]) -> Option<ParsedFrame>` | 解析收到的 P2P 帧（静态方法） |
+| `ice_state` | `(&self) -> Option<IceState>` | 获取当前 ICE 连接状态 |
+| `stop_ice` | `(&mut self)` | 停止 ICE，释放资源 |
 
 ---
 
-### 1.3 IDS 查询
-
-##### `queryIds(appId: string, userId: string): IdsResponse`
-
-查询 IDS 获取对端信息。**同步阻塞 HTTP 调用**（10s 超时）。
-
-**参数**：
-
-| 参数 | 类型 | 必选 | 说明 |
-|------|------|------|------|
-| appId | string | 是 | 应用 ID |
-| userId | string | 是 | 对端用户 ID |
-
-**返回值**：`IdsResponse`（定义见 1.2）
-
-```typescript
-const resp: IdsResponse = ppsdk.queryIds(appId, userId)
-if (resp.data !== undefined && resp.data.length > 0) {
-  for (let i = 0; i < resp.data.length; i++) {
-    const record: IdsRecord = resp.data[i]
-    if (record.type === 'service' && record.token.length > 0) {
-      // 找到 service 记录
-      break
-    }
-  }
-}
-```
-
----
-
-### 1.4 建立连接
-
-##### `connect(peerId: string, odid: string, isDevice?: boolean, heartbeatInterval?: number): number`
-
-一站式建立 P2P 通道，内部自动串联以下步骤：
-
-1. `generateToken` — 生成访问 NAT 服务的 JWT Token
-2. `gatherCandidates` — 收集 ICE 候选地址
-3. `iceSdpNegotiate` — 发起 SDP 协商
-
-**参数**：
-
-| 参数 | 类型 | 必选 | 说明 |
-|------|------|------|------|
-| peerId | string | 是 | 从 IDS 查询到的对端 token 值 |
-| odid | string | 是 | 本端设备标识 |
-| isDevice | boolean | 否 | `false`（缺省）= 对端为云服务，`true` = 对端为 App（预留） |
-| heartbeatInterval | number | 否 | 心跳间隔（秒），缺省 30 |
-
-非阻塞，后台线程执行。返回 `0` 表示参数正确并已启动后台线程，实际连接结果通过 `onStateChange` 回调获取。
-
----
-
-### 1.5 通道状态上报
-
-##### `onStateChange(cb: (state: string) => void): void`
-
-注册 P2P 通道状态变化回调。
-
-**参数**：
-
-| 参数 | 类型 | 必选 | 说明 |
-|------|------|------|------|
-| cb | `(state: string) => void` | 是 | 状态变化回调函数 |
-
-**state 取值**：
-
-| 状态 | 说明 |
-|------|------|
-| `NEW` | 初始化 |
-| `CONNECTING` | 连通性检查中 |
-| `CONNECTED` | 首个候选对成功 |
-| `COMPLETED` | 提名完成，通道可用 |
-| `FAILED` | 协商失败 |
-| `CONNECTOR_REGISTERED` | Connector 注册成功 |
-| `CONNECTOR_DISCONNECTED` | Connector 断开 |
-
----
-
-### 1.6 数据发送
-
-##### `send(data: string | ArrayBuffer): number`
-
-通过已建立的 P2P 通道发送数据。传入 `string` 时内部自动封装为 P2P 数据帧，传入 `ArrayBuffer` 时直接发送原始字节。
-
-**参数**：
-
-| 参数 | 类型 | 必选 | 说明 |
-|------|------|------|------|
-| data | string \| ArrayBuffer | 是 | 待发送数据。string 自动封装为数据帧，ArrayBuffer 直接发送原始字节 |
-
-**返回值**：`0` = 成功，负值 = 失败
-
-- **前置**: ICE 状态为 COMPLETED 或 CONNECTED
-
----
-
-### 1.7 数据接收
-
-##### `onDataReceived(cb: (data: ArrayBuffer) => void): void`
-
-注册数据接收回调。P2P 通道建立后，收到对端应用数据时触发（STUN 协议消息已自动过滤）。
-
-**参数**：
-
-| 参数 | 类型 | 必选 | 说明 |
-|------|------|------|------|
-| cb | `(data: ArrayBuffer) => void` | 是 | 数据接收回调函数 |
-
----
-
-### 1.8 关闭
-
-##### `close(): number`
-
-关闭所有连接，停止所有线程，释放资源。
-
-**返回值**：`0` = 成功
-
----
-
-### 内部接口
-
-以下接口为 SDK 内部使用，通常不需要 App 层直接调用。
-
----
-
-### 1.9 Token 生成
-
-##### `generateToken(): string`
-
-生成用于访问 NAT 服务的 JWT Token。
-
-**返回值**：JWT Token 字符串。失败时返回空字符串。
-
-```typescript
-const token: string = ppsdk.generateToken()
-```
-
----
-
-### 1.10 候选地址收集
-
-##### `gatherCandidates(p2pToken: string): CandidateInfo`
-
-**同步阻塞调用**，收集所有 ICE 候选地址。内部执行 HTTP 请求 + STUN/TURN 交互，耗时可达数秒。
-
-**参数**：
-
-| 参数 | 类型 | 必选 | 说明 |
-|------|------|------|------|
-| p2pToken | string | 是 | 访问 NAT 服务的 JWT Token（通过 `generateToken()` 获取） |
-
-**返回值**：`CandidateInfo`
-
-**CandidateInfo**:
-
-| 属性 | 类型 | 说明 |
-|------|------|------|
-| `candidateLines` | `string[]` | 所有候选行（host + srflx + relay） |
-| `localAddresses` | `string[]` | 本机 IP 地址列表 |
-| `stunExternalIp` | `string` | STUN 公网映射 IP |
-| `stunExternalPort` | `string` | STUN 公网映射端口 |
-| `turnRelayIp` | `string` | TURN 中继 IP |
-| `turnRelayPort` | `string` | TURN 中继端口 |
-
-```typescript
-const info: CandidateInfo = ppsdk.gatherCandidates(token)
-```
-
----
-
-### 1.11 ICE SDP 协商
-
-##### `iceSdpNegotiate(peerId: string, odid: string, isDevice?: boolean): number`
-
-发起 ICE SDP 协商，建立 P2P 通道。适用于端-云服务和端-端两种场景（端-端场景预留，当前仅实现端-云服务）。非阻塞，后台线程执行。
-
-**参数**：
-
-| 参数 | 类型 | 必选 | 说明 |
-|------|------|------|------|
-| peerId | string | 是 | 从 IDS 查询到的对端 token 值。云服务场景为 `ip:port`，端-端场景为 Push Token |
-| odid | string | 是 | 本端设备标识，写入 SDP `o=` 字段供对端识别 |
-| isDevice | boolean | 否 | `false`（缺省）= 对端为云服务（ICE-Lite），`true` = 对端为 App（ICE-Full，预留） |
-
-**内部流程**：
-
-1. 从已有 ICE Agent 获取本地候选
-2. 生成 SDP offer，`o=` 字段写入本端 odid
-3. HTTP POST `http://{peerId}/api/ice/offer`（Content-Type: `application/sdp`）
-4. 解析 SDP answer
-5. 启动 ICE 线程进行连通性检查
-
-返回 `0` 表示参数正确并已启动后台线程，实际连接结果通过 `onStateChange` 回调获取。
-
----
-
-### 1.12 帧编解码
-
-##### `encodeDataFrame(text: string): ArrayBuffer`
-
-将文本编码为 P2P 数据帧。
-
-**参数**：
-
-| 参数 | 类型 | 必选 | 说明 |
-|------|------|------|------|
-| text | string | 是 | 待编码的文本内容 |
-
-**返回值**：编码后的 `ArrayBuffer`
-
-```typescript
-const frame: ArrayBuffer = ppsdk.encodeDataFrame('Hello')
-ppsdk.send(frame)
-```
-
-##### `encodeHeartbeatReply(): ArrayBuffer`
-
-生成心跳回复帧。
-
-**返回值**：心跳回复帧的 `ArrayBuffer`
-
-##### `parseFrame(data: ArrayBuffer): ParsedFrame`
-
-解析收到的 P2P 帧。
-
-**参数**：
-
-| 参数 | 类型 | 必选 | 说明 |
-|------|------|------|------|
-| data | ArrayBuffer | 是 | 待解析的原始帧数据 |
-
-**返回值**：`ParsedFrame`
-
-**ParsedFrame**:
-
-| 属性 | 类型 | 说明 |
-|------|------|------|
-| `type` | `number` | 帧类型：`0`=无效，`1`=心跳，`2`=数据 |
-| `payload` | `ArrayBuffer` | 帧载荷 |
-
-```typescript
-const frame: ParsedFrame = ppsdk.parseFrame(data)
-if (frame.type === 1) {
-  const reply: ArrayBuffer = ppsdk.encodeHeartbeatReply()
-  ppsdk.send(reply)
-} else if (frame.type === 2) {
-  const text: string = new util.TextDecoder().decodeToString(new Uint8Array(frame.payload))
-}
-```
-
-##### `isStunMessage(data: ArrayBuffer): boolean`
-
-判断数据是否为 STUN 协议消息。
-
-**参数**：
-
-| 参数 | 类型 | 必选 | 说明 |
-|------|------|------|------|
-| data | ArrayBuffer | 是 | 待判断的原始数据 |
-
-**返回值**：`true` = STUN 消息，`false` = 非 STUN 消息
-
----
-
-### 1.13 其他回调
-
-##### `onLog(cb: (msg: string) => void): void`
-
-注册日志回调，接收 Rust 侧的调试日志。
-
-**参数**：
-
-| 参数 | 类型 | 必选 | 说明 |
-|------|------|------|------|
-| cb | `(msg: string) => void` | 是 | 日志回调函数 |
-
-##### `onConnectorStateChange(cb: (connected: boolean) => void): void`
-
-注册 Connector 连接状态回调。（开发中）
-
-**参数**：
-
-| 参数 | 类型 | 必选 | 说明 |
-|------|------|------|------|
-| cb | `(connected: boolean) => void` | 是 | 连接状态回调，`true`=已连接，`false`=已断开 |
-
----
-
-### 1.14 常量
-
-| 常量 | 值 | 说明 |
-|------|-----|------|
-| `TYPE_HEARTBEAT` | `1` | 心跳帧类型 |
-| `TYPE_DATA` | `2` | 数据帧类型 |
-
----
-
-### 1.15 Connector 信令（开发中）
-
-##### `connectConnector(url: string, identifier: string, authToken: string): number`
-
-连接 WebSocket 信令服务器。后台线程自动重连（指数退避 1s→30s）。
-
-**参数**：
-
-| 参数 | 类型 | 必选 | 说明 |
-|------|------|------|------|
-| url | string | 是 | WebSocket 信令服务器地址 |
-| identifier | string | 是 | 本端标识 |
-| authToken | string | 是 | 认证 Token |
-
-**返回值**：`0` = 成功，负值 = 失败
-
-##### `disconnectConnector(): number`
-
-断开 Connector 连接。
-
-**返回值**：`0` = 成功
-
-##### `isConnectorRegistered(): number`
-
-查询 Connector 注册状态。
-
-**返回值**：`1` = 已注册，`0` = 未注册
-
-##### `initiateIce(targetId: string): number`
-
-通过 Connector 信令向对端发起 ICE 协商。后台线程处理 ICE offer/answer。
-
-**参数**：
-
-| 参数 | 类型 | 必选 | 说明 |
-|------|------|------|------|
-| targetId | string | 是 | 对端标识 |
-
-**返回值**：`0` = 成功，负值 = 失败
-
-##### `stopIce(): number`
-
-停止 ICE Agent。
-
-**返回值**：`0` = 成功
-
----
-
-## 第二部分：Rust Crate 接口（面向 Rust 开发者）
-
-### 外部接口
-
----
-
-#### 2.1 p2p-sdk — SDK 门面（P2pClient）
+### 1.1 p2p-sdk — SDK 门面（P2pClient）
 
 `P2pClient` 是高层 SDK 入口，编排 ICE/STUN/TURN/IDS 全流程。
 
@@ -480,13 +58,13 @@ if (frame.type === 1) {
 
 | 参数 | 类型 | 必选 | 说明 |
 |------|------|------|------|
-| http | `&dyn HttpTransport` | 是 | HTTP 传输实现（定义见 2.9） |
+| http | `&dyn HttpTransport` | 是 | HTTP 传输实现（定义见 1.10） |
 | app_id | `&str` | 是 | 应用 ID |
 | user_id | `&str` | 是 | 用户 ID |
 | odid | `&str` | 是 | 本端设备标识 |
 | push_token | `&str` | 是 | 推送 Token |
 
-**返回值**：`Result<IdsResponse, String>`（IdsResponse 定义见 1.2）
+**返回值**：`Result<IdsResponse, String>`（IdsResponse 定义见 2.2）
 
 ##### `P2pClient::query_ids(&self, http, app_id, user_id) -> Result<IdsResponse, String>`
 
@@ -496,11 +74,99 @@ if (frame.type === 1) {
 
 | 参数 | 类型 | 必选 | 说明 |
 |------|------|------|------|
-| http | `&dyn HttpTransport` | 是 | HTTP 传输实现（定义见 2.9） |
+| http | `&dyn HttpTransport` | 是 | HTTP 传输实现（定义见 1.10） |
 | app_id | `&str` | 是 | 应用 ID |
 | user_id | `&str` | 是 | 对端用户 ID |
 
-**返回值**：`Result<IdsResponse, String>`（IdsResponse 定义见 1.2）
+**返回值**：`Result<IdsResponse, String>`（IdsResponse 定义见 2.2）
+
+##### `P2pClient::send_text(&self, text: &str) -> Option<IceAction>`
+
+通过已建立的 P2P 通道发送文本。文本内部自动封装为 P2P 数据帧。
+
+**参数**：
+
+| 参数 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| text | `&str` | 是 | 待发送的文本内容 |
+
+**返回值**：`Some(IceAction)` 表示有数据待发送，`None` 表示尚未建立通道
+
+##### `P2pClient::send_data(&self, data: &[u8]) -> Option<IceAction>`
+
+通过已建立的 P2P 通道发送二进制数据。
+
+**参数**：
+
+| 参数 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| data | `&[u8]` | 是 | 待发送的二进制数据 |
+
+**返回值**：`Some(IceAction)` 表示有数据待发送，`None` 表示尚未建立通道
+
+##### `P2pClient::handle_incoming_udp(&mut self, data: &[u8], from_ip: &str, from_port: u16) -> HandleDataResult`
+
+处理收到的 UDP 数据。自动处理 STUN 协议消息，返回应用层数据和待发送的响应包。
+
+**参数**：
+
+| 参数 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| data | `&[u8]` | 是 | 收到的原始数据 |
+| from_ip | `&str` | 是 | 发送方 IP |
+| from_port | `u16` | 是 | 发送方端口 |
+
+**返回值**：`HandleDataResult`
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| app_data | `Option<Vec<u8>>` | 应用层数据（非 STUN 消息时为 Some） |
+| actions | `Vec<IceAction>` | 需要发送的响应包 |
+
+##### `P2pClient::parse_received(data: &[u8]) -> Option<ParsedFrame>`
+
+解析收到的 P2P 帧（静态方法）。
+
+**参数**：
+
+| 参数 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| data | `&[u8]` | 是 | `handle_incoming_udp` 返回的 app_data |
+
+**返回值**：`Option<ParsedFrame>`（定义见 1.7），无效帧返回 `None`
+
+##### `P2pClient::ice_state(&self) -> Option<IceState>`
+
+获取当前 ICE 连接状态。
+
+**返回值**：`Some(IceState)`（定义见 1.5），未初始化时返回 `None`
+
+##### `P2pClient::stop_ice(&mut self)`
+
+停止 ICE Agent，关闭所有连接，释放资源。
+
+---
+
+### 内部接口
+
+以下接口为 SDK 内部使用，通常不需要 App 层直接调用。
+
+---
+
+### 1.2 p2p-sdk — NAT 路由与候选收集
+
+##### `P2pClient::resolve_nat_route(&self, http, p2p_token) -> Result<(), String>`
+
+解析 NAT 路由，获取 STUN/TURN 服务器地址。内部执行两次 HTTP POST（type=2 STUN, type=3 TURN），失败不阻塞流程。
+
+**参数**：
+
+| 参数 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| http | `&dyn HttpTransport` | 是 | HTTP 传输实现 |
+| p2p_token | `&str` | 是 | 访问 NAT 服务的 JWT Token |
+
+**返回值**：`Result<(), String>`
 
 ##### `P2pClient::gather_candidates(&self, http, platform, p2p_token, nat_url) -> Result<CandidateInfo, String>`
 
@@ -510,39 +176,34 @@ if (frame.type === 1) {
 
 | 参数 | 类型 | 必选 | 说明 |
 |------|------|------|------|
-| http | `&dyn HttpTransport` | 是 | HTTP 传输实现（定义见 2.9） |
-| platform | `&dyn Platform` | 是 | 平台能力实现（定义见 2.9） |
+| http | `&dyn HttpTransport` | 是 | HTTP 传输实现 |
+| platform | `&dyn Platform` | 是 | 平台能力实现 |
 | p2p_token | `&str` | 是 | 访问 NAT 服务的 JWT Token |
 | nat_url | `&str` | 是 | NAT 路由服务 URL |
 
-**返回值**：`Result<CandidateInfo, String>`（CandidateInfo 定义见 1.10）
+**返回值**：`Result<CandidateInfo, String>`（CandidateInfo 定义见 2.10）
 
-##### `P2pClient::ice_sdp_negotiate(&self, http, peer_id, odid, is_device) -> Result<(), String>`
+##### `P2pClient::setup_ice_and_gather(&self, udp, platform, p2p_token, is_controlling) -> Result<(), String>`
 
-发起 ICE SDP 协商，建立 P2P 通道。
+创建 ICE Agent 并收集候选地址。内部调用 `resolve_nat_route` + `gather_candidates`。
+
+##### `P2pClient::connect_via_sdp(&self, http, peer_addr, odid) -> Result<(), String>`
+
+发起 SDP 协商，建立 P2P 通道。向对端 `http://{peer_addr}/api/ice/offer` POST SDP offer。
 
 **参数**：
 
 | 参数 | 类型 | 必选 | 说明 |
 |------|------|------|------|
-| http | `&dyn HttpTransport` | 是 | HTTP 传输实现（定义见 2.9） |
-| peer_id | `&str` | 是 | 对端地址（`ip:port`） |
+| http | `&dyn HttpTransport` | 是 | HTTP 传输实现 |
+| peer_addr | `&str` | 是 | 对端地址（`ip:port`） |
 | odid | `&str` | 是 | 本端设备标识 |
-| is_device | `bool` | 是 | `false`=对端为云服务，`true`=对端为 App |
 
 **返回值**：`Result<(), String>`
 
-##### `P2pClient::close(&mut self)`
-
-关闭所有连接，释放资源。
-
 ---
 
-### 内部接口
-
----
-
-#### 2.2 p2p-core — Token 生成
+### 1.3 p2p-core — Token 生成（内部）
 
 ##### `generate_token() -> String`
 
@@ -552,7 +213,7 @@ if (frame.type === 1) {
 
 ---
 
-#### 2.3 p2p-core — STUN/TURN Client
+### 1.4 p2p-core — STUN/TURN Client
 
 通过 DTLS 加密的 STUN/TURN 交互。使用闭包注入 I/O（Sans-IO）。
 
@@ -607,7 +268,7 @@ if (frame.type === 1) {
 
 ---
 
-#### 2.4 p2p-core — ICE Agent
+### 1.5 p2p-core — ICE Agent
 
 **Sans-IO** 状态机实现，不持有任何 I/O 资源。
 
@@ -774,7 +435,7 @@ if (frame.type === 1) {
 
 ---
 
-#### 2.5 p2p-core — SDP
+### 1.6 p2p-core — SDP
 
 ##### `generate_sdp_offer(odid, local_ufrag, local_pwd, candidates, default_ip, default_port) -> String`
 
@@ -807,7 +468,7 @@ if (frame.type === 1) {
 
 ---
 
-#### 2.6 p2p-core — Frame
+### 1.7 p2p-core — Frame
 
 ##### `encode_data_frame(text: &str) -> Vec<u8>`
 
@@ -860,18 +521,14 @@ if (frame.type === 1) {
 
 ---
 
-### 常量定义
-
----
-
-#### 2.7 帧类型常量
+### 1.8 帧类型常量
 
 | 常量 | 值 | 说明 |
 |------|-----|------|
 | `TYPE_HEARTBEAT` | `0x00000001` | 心跳帧 |
 | `TYPE_DATA` | `0x00000002` | 数据帧 |
 
-#### 2.8 地址族常量
+### 1.9 地址族常量
 
 | 常量 | 值 | 说明 |
 |------|-----|------|
@@ -880,11 +537,7 @@ if (frame.type === 1) {
 
 ---
 
-### 平台抽象
-
----
-
-#### 2.9 p2p-io — I/O Traits
+### 1.10 p2p-io — I/O Traits（平台抽象）
 
 ##### `UdpTransport`
 
@@ -922,7 +575,7 @@ if (frame.type === 1) {
 
 ---
 
-#### 2.10 p2p-tokio — 同步实现
+### 1.11 p2p-tokio — 同步实现
 
 基于标准库的同步阻塞 I/O 实现，匹配 NAPI 同步调用模型。
 
@@ -962,7 +615,7 @@ if (frame.type === 1) {
 
 ---
 
-#### 2.11 p2p-napi — NAPI 导出
+### 1.12 p2p-napi — NAPI 导出
 
 `libppsdk.so` 通过 Raw NAPI 导出函数，通过 `.init_array` 自动注册。
 
@@ -1019,6 +672,458 @@ if (frame.type === 1) {
 | 20 | `isConnectorRegistered()` | `() → number` | Connector 注册状态 |
 | 21 | `initiateIce(targetId)` | `(string) → number` | 通过 Connector 发起 ICE |
 | 22 | `stopIce()` | `() → number` | 停止 ICE Agent |
+
+---
+
+## 第二部分：ArkTS 调用接口（面向鸿蒙 Next App）
+
+App 通过 `import ppsdk from 'libppsdk.so'` 直接调用所有 SDK 功能，无需 ETS 封装层。类型声明由 `cpp/types/libppsdk/index.d.ts` 提供。
+
+```typescript
+import ppsdk from 'libppsdk.so'
+
+// 初始化
+ppsdk.init(JSON.stringify({ idsUrl: '...', natUrl: '...' }))
+```
+
+> **ArkTS 严格模式注意**：`ppsdk` 返回值为 `any`，接收返回值的变量必须显式标注类型。
+
+### 公开接口总览
+
+| 方法 | 签名 | 说明 |
+|------|------|------|
+| `init` | `(configJson: string): number` | 初始化 SDK |
+| `registerIds` | `(appId: string, userId: string, odid: string, pushToken: string): IdsResponse` | 注册到 IDS |
+| `queryIds` | `(appId: string, userId: string): IdsResponse` | 查询 IDS |
+| `connect` | `(peerId: string, odid: string, isDevice?: boolean, heartbeatInterval?: number): number` | 一站式建立 P2P 通道 |
+| `onStateChange` | `(cb: (state: string) => void): void` | 注册通道状态回调 |
+| `send` | `(data: string \| ArrayBuffer): number` | 发送数据 |
+| `onDataReceived` | `(cb: (data: ArrayBuffer) => void): void` | 注册数据接收回调 |
+| `close` | `(): number` | 关闭所有连接 |
+
+---
+
+### 2.1 初始化
+
+##### `init(configJson: string): number`
+
+传入 JSON 字符串形式的配置，初始化 SDK。
+
+**参数**：
+
+| 参数 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| configJson | string | 是 | JSON 字符串，字段见下表 |
+
+**configJson 字段**：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| idsUrl | string | IDS 服务地址（`host:port`） |
+| natUrl | string | NAT 路由服务 URL |
+
+**返回值**：`0` = 成功，负值 = 失败
+
+```typescript
+ppsdk.init(JSON.stringify({
+  idsUrl: 'ids-host:port',
+  natUrl: 'https://natservice...',
+}))
+```
+
+---
+
+### 2.2 IDS 注册
+
+##### `registerIds(appId: string, userId: string, odid: string, pushToken: string): IdsResponse`
+
+向 IDS 服务注册本端信息。**同步阻塞 HTTP 调用**（10s 超时）。
+
+**参数**：
+
+| 参数 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| appId | string | 是 | 应用 ID |
+| userId | string | 是 | 用户 ID |
+| odid | string | 是 | 本端设备标识 |
+| pushToken | string | 是 | 推送 Token |
+
+**返回值**：`IdsResponse`
+
+**IdsResponse**:
+
+| 属性 | 类型 | 说明 |
+|------|------|------|
+| `code` | `number` | 响应码 |
+| `message` | `string` | 响应消息 |
+| `error` | `string \| undefined` | 错误信息（仅失败时存在） |
+| `data` | `IdsRecord[] \| undefined` | 记录数组（可能不存在） |
+
+**IdsRecord**:
+
+| 属性 | 类型 | 说明 |
+|------|------|------|
+| `appId` | `string` | 应用 ID |
+| `userId` | `string` | 用户 ID |
+| `type` | `string` | 记录类型（`'app'`、`'service'` 等） |
+| `odid` | `string` | 设备 ODID |
+| `token` | `string` | 信令地址或 Push Token |
+
+```typescript
+const resp: IdsResponse = ppsdk.registerIds(appId, userId, odid, pushToken)
+if (resp.error !== undefined && resp.error.length > 0) {
+  // 注册失败
+} else {
+  // 注册成功
+}
+```
+
+---
+
+### 2.3 IDS 查询
+
+##### `queryIds(appId: string, userId: string): IdsResponse`
+
+查询 IDS 获取对端信息。**同步阻塞 HTTP 调用**（10s 超时）。
+
+**参数**：
+
+| 参数 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| appId | string | 是 | 应用 ID |
+| userId | string | 是 | 对端用户 ID |
+
+**返回值**：`IdsResponse`（定义见 2.2）
+
+```typescript
+const resp: IdsResponse = ppsdk.queryIds(appId, userId)
+if (resp.data !== undefined && resp.data.length > 0) {
+  for (let i = 0; i < resp.data.length; i++) {
+    const record: IdsRecord = resp.data[i]
+    if (record.type === 'service' && record.token.length > 0) {
+      // 找到 service 记录
+      break
+    }
+  }
+}
+```
+
+---
+
+### 2.4 建立连接
+
+##### `connect(peerId: string, odid: string, isDevice?: boolean, heartbeatInterval?: number): number`
+
+一站式建立 P2P 通道，内部自动串联以下步骤：
+
+1. `generateToken` — 生成访问 NAT 服务的 JWT Token
+2. `gatherCandidates` — 收集 ICE 候选地址
+3. `iceSdpNegotiate` — 发起 SDP 协商
+
+**参数**：
+
+| 参数 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| peerId | string | 是 | 从 IDS 查询到的对端 token 值 |
+| odid | string | 是 | 本端设备标识 |
+| isDevice | boolean | 否 | `false`（缺省）= 对端为云服务，`true` = 对端为 App（预留） |
+| heartbeatInterval | number | 否 | 心跳间隔（秒），缺省 30 |
+
+非阻塞，后台线程执行。返回 `0` 表示参数正确并已启动后台线程，实际连接结果通过 `onStateChange` 回调获取。
+
+---
+
+### 2.5 通道状态上报
+
+##### `onStateChange(cb: (state: string) => void): void`
+
+注册 P2P 通道状态变化回调。
+
+**参数**：
+
+| 参数 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| cb | `(state: string) => void` | 是 | 状态变化回调函数 |
+
+**state 取值**：
+
+| 状态 | 说明 |
+|------|------|
+| `NEW` | 初始化 |
+| `CONNECTING` | 连通性检查中 |
+| `CONNECTED` | 首个候选对成功 |
+| `COMPLETED` | 提名完成，通道可用 |
+| `FAILED` | 协商失败 |
+| `CONNECTOR_REGISTERED` | Connector 注册成功 |
+| `CONNECTOR_DISCONNECTED` | Connector 断开 |
+
+---
+
+### 2.6 数据发送
+
+##### `send(data: string | ArrayBuffer): number`
+
+通过已建立的 P2P 通道发送数据。传入 `string` 时内部自动封装为 P2P 数据帧，传入 `ArrayBuffer` 时直接发送原始字节。
+
+**参数**：
+
+| 参数 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| data | string \| ArrayBuffer | 是 | 待发送数据。string 自动封装为数据帧，ArrayBuffer 直接发送原始字节 |
+
+**返回值**：`0` = 成功，负值 = 失败
+
+- **前置**: ICE 状态为 COMPLETED 或 CONNECTED
+
+---
+
+### 2.7 数据接收
+
+##### `onDataReceived(cb: (data: ArrayBuffer) => void): void`
+
+注册数据接收回调。P2P 通道建立后，收到对端应用数据时触发（STUN 协议消息已自动过滤）。
+
+**参数**：
+
+| 参数 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| cb | `(data: ArrayBuffer) => void` | 是 | 数据接收回调函数 |
+
+---
+
+### 2.8 关闭
+
+##### `close(): number`
+
+关闭所有连接，停止所有线程，释放资源。
+
+**返回值**：`0` = 成功
+
+---
+
+### 内部接口
+
+以下接口为 SDK 内部使用，通常不需要 App 层直接调用。
+
+---
+
+### 2.9 Token 生成
+
+##### `generateToken(): string`
+
+生成用于访问 NAT 服务的 JWT Token。
+
+**返回值**：JWT Token 字符串。失败时返回空字符串。
+
+```typescript
+const token: string = ppsdk.generateToken()
+```
+
+---
+
+### 2.10 候选地址收集
+
+##### `gatherCandidates(p2pToken: string): CandidateInfo`
+
+**同步阻塞调用**，收集所有 ICE 候选地址。内部执行 HTTP 请求 + STUN/TURN 交互，耗时可达数秒。
+
+**参数**：
+
+| 参数 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| p2pToken | string | 是 | 访问 NAT 服务的 JWT Token（通过 `generateToken()` 获取） |
+
+**返回值**：`CandidateInfo`
+
+**CandidateInfo**:
+
+| 属性 | 类型 | 说明 |
+|------|------|------|
+| `candidateLines` | `string[]` | 所有候选行（host + srflx + relay） |
+| `localAddresses` | `string[]` | 本机 IP 地址列表 |
+| `stunExternalIp` | `string` | STUN 公网映射 IP |
+| `stunExternalPort` | `string` | STUN 公网映射端口 |
+| `turnRelayIp` | `string` | TURN 中继 IP |
+| `turnRelayPort` | `string` | TURN 中继端口 |
+
+```typescript
+const info: CandidateInfo = ppsdk.gatherCandidates(token)
+```
+
+---
+
+### 2.11 ICE SDP 协商
+
+##### `iceSdpNegotiate(peerId: string, odid: string, isDevice?: boolean): number`
+
+发起 ICE SDP 协商，建立 P2P 通道。适用于端-云服务和端-端两种场景（端-端场景预留，当前仅实现端-云服务）。非阻塞，后台线程执行。
+
+**参数**：
+
+| 参数 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| peerId | string | 是 | 从 IDS 查询到的对端 token 值。云服务场景为 `ip:port`，端-端场景为 Push Token |
+| odid | string | 是 | 本端设备标识，写入 SDP `o=` 字段供对端识别 |
+| isDevice | boolean | 否 | `false`（缺省）= 对端为云服务（ICE-Lite），`true` = 对端为 App（ICE-Full，预留） |
+
+**内部流程**：
+
+1. 从已有 ICE Agent 获取本地候选
+2. 生成 SDP offer，`o=` 字段写入本端 odid
+3. HTTP POST `http://{peerId}/api/ice/offer`（Content-Type: `application/sdp`）
+4. 解析 SDP answer
+5. 启动 ICE 线程进行连通性检查
+
+返回 `0` 表示参数正确并已启动后台线程，实际连接结果通过 `onStateChange` 回调获取。
+
+---
+
+### 2.12 帧编解码
+
+##### `encodeDataFrame(text: string): ArrayBuffer`
+
+将文本编码为 P2P 数据帧。
+
+**参数**：
+
+| 参数 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| text | string | 是 | 待编码的文本内容 |
+
+**返回值**：编码后的 `ArrayBuffer`
+
+```typescript
+const frame: ArrayBuffer = ppsdk.encodeDataFrame('Hello')
+ppsdk.send(frame)
+```
+
+##### `encodeHeartbeatReply(): ArrayBuffer`
+
+生成心跳回复帧。
+
+**返回值**：心跳回复帧的 `ArrayBuffer`
+
+##### `parseFrame(data: ArrayBuffer): ParsedFrame`
+
+解析收到的 P2P 帧。
+
+**参数**：
+
+| 参数 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| data | ArrayBuffer | 是 | 待解析的原始帧数据 |
+
+**返回值**：`ParsedFrame`
+
+**ParsedFrame**:
+
+| 属性 | 类型 | 说明 |
+|------|------|------|
+| `type` | `number` | 帧类型：`0`=无效，`1`=心跳，`2`=数据 |
+| `payload` | `ArrayBuffer` | 帧载荷 |
+
+```typescript
+const frame: ParsedFrame = ppsdk.parseFrame(data)
+if (frame.type === 1) {
+  const reply: ArrayBuffer = ppsdk.encodeHeartbeatReply()
+  ppsdk.send(reply)
+} else if (frame.type === 2) {
+  const text: string = new util.TextDecoder().decodeToString(new Uint8Array(frame.payload))
+}
+```
+
+##### `isStunMessage(data: ArrayBuffer): boolean`
+
+判断数据是否为 STUN 协议消息。
+
+**参数**：
+
+| 参数 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| data | ArrayBuffer | 是 | 待判断的原始数据 |
+
+**返回值**：`true` = STUN 消息，`false` = 非 STUN 消息
+
+---
+
+### 2.13 其他回调
+
+##### `onLog(cb: (msg: string) => void): void`
+
+注册日志回调，接收 Rust 侧的调试日志。
+
+**参数**：
+
+| 参数 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| cb | `(msg: string) => void` | 是 | 日志回调函数 |
+
+##### `onConnectorStateChange(cb: (connected: boolean) => void): void`
+
+注册 Connector 连接状态回调。（开发中）
+
+**参数**：
+
+| 参数 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| cb | `(connected: boolean) => void` | 是 | 连接状态回调，`true`=已连接，`false`=已断开 |
+
+---
+
+### 2.14 常量
+
+| 常量 | 值 | 说明 |
+|------|-----|------|
+| `TYPE_HEARTBEAT` | `1` | 心跳帧类型 |
+| `TYPE_DATA` | `2` | 数据帧类型 |
+
+---
+
+### 2.15 Connector 信令（开发中）
+
+##### `connectConnector(url: string, identifier: string, authToken: string): number`
+
+连接 WebSocket 信令服务器。后台线程自动重连（指数退避 1s→30s）。
+
+**参数**：
+
+| 参数 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| url | string | 是 | WebSocket 信令服务器地址 |
+| identifier | string | 是 | 本端标识 |
+| authToken | string | 是 | 认证 Token |
+
+**返回值**：`0` = 成功，负值 = 失败
+
+##### `disconnectConnector(): number`
+
+断开 Connector 连接。
+
+**返回值**：`0` = 成功
+
+##### `isConnectorRegistered(): number`
+
+查询 Connector 注册状态。
+
+**返回值**：`1` = 已注册，`0` = 未注册
+
+##### `initiateIce(targetId: string): number`
+
+通过 Connector 信令向对端发起 ICE 协商。后台线程处理 ICE offer/answer。
+
+**参数**：
+
+| 参数 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| targetId | string | 是 | 对端标识 |
+
+**返回值**：`0` = 成功，负值 = 失败
+
+##### `stopIce(): number`
+
+停止 ICE Agent。
+
+**返回值**：`0` = 成功
 
 ---
 

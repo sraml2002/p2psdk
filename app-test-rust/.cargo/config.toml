@@ -1,3 +1,9 @@
 [target.aarch64-unknown-linux-ohos]
 linker = "/Users/sram/Library/OpenHarmony/Sdk/20/native/llvm/bin/aarch64-unknown-linux-ohos-clang"
 ar = "/Users/sram/Library/OpenHarmony/Sdk/20/native/llvm/bin/llvm-ar"
+
+[env]
+CC_aarch64-unknown-linux-ohos = "/Users/sram/Library/OpenHarmony/Sdk/20/native/llvm/bin/aarch64-unknown-linux-ohos-clang"
+CXX_aarch64-unknown-linux-ohos = "/Users/sram/Library/OpenHarmony/Sdk/20/native/llvm/bin/aarch64-unknown-linux-ohos-clang++"
+AR_aarch64-unknown-linux-ohos = "/Users/sram/Library/OpenHarmony/Sdk/20/native/llvm/bin/llvm-ar"
+OHOS_NDK_HOME = "/Users/sram/Library/OpenHarmony/Sdk/20"
