@@ -1,0 +1,8 @@
+{
+  "src": [
+    "pages/Index",
+    "pages/PushTokenPage",
+    "pages/IdsPage",
+    "pages/IdsPage2"
+  ]
+}

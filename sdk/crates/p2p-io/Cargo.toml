@@ -1,0 +1,8 @@
+[package]
+name = "p2p-io"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+p2p-core = { path = "../p2p-core" }
+thiserror = { workspace = true }

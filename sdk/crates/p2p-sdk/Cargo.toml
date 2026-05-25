@@ -1,0 +1,12 @@
+[package]
+name = "p2p-sdk"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+p2p-core = { path = "../p2p-core" }
+p2p-io = { path = "../p2p-io" }
+thiserror = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

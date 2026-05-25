@@ -1,0 +1,27 @@
+# Rust
+sdk/target/
+
+# HarmonyOS build
+app-test-hmos/.cxx/
+app-test-hmos/build/
+app-test-hmos/entry/build/
+app-test-hmos/.hvigor/
+app-test-hmos/.preview/
+app-test-hmos/oh_modules/
+app-test-hmos/entry/oh_modules/
+app-test-hmos/entry/libs/arm64-v8a/
+app-test-hmos/local.properties
+app-test-hmos/oh-package-lock.json5
+
+# IDE
+.idea/
+.clang-tidy
+.clangd
+.hvigor/
+.DS_Store
+
+# Claude
+.claude/
+
+# 构建时嵌入的敏感凭证，禁止提交
+*.nogit

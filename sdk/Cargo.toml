@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/p2p-core",
+    "crates/p2p-io",
+    "crates/p2p-sdk",
+    "crates/p2p-napi",
+    "crates/p2p-tokio",
+    "crates/dimpl",
+]
+
+[workspace.dependencies]
+# Crypto
+p256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
+sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+crc = "3"
+rand = "0.8"
+
+# Error handling
+thiserror = "2"
+
+# Logging
+log = "0.4"
+
+# Bytes
+bytes = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Base64
+base64 = "0.22"
+
+# DTLS
+dimpl = { path = "crates/dimpl" }
+
+# AES-GCM (for encrypted key decryption)
+aes-gcm = "0.10"
+
+# Logging output
+env_logger = "0.11"
+
+# NAPI bridge for HarmonyOS (ohos-rs fork)
+napi-ohos = { version = "1", features = ["serde-json"] }
+napi-derive-ohos = "1"
+napi-build-ohos = "1"
+
+# Tokio I/O (Phase 8)
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+tungstenite = { version = "0.24", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+
+# Dev dependencies
+hex = "0.4"

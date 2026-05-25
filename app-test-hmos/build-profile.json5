@@ -1,0 +1,67 @@
+{
+  "app": {
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "/Users/sram/.ohos/config/default_hmosdemo_C6NjTFK6IUnZLkLo1GAqK8fAzKQ-RkFlwgUPdsUTahM=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001B62C79B1B30CE79F3AA8FA69465DF51824A4CC5726448EB117EC79DA2D647A57664D30C808834F7",
+          "profile": "/Users/sram/.ohos/config/default_hmosdemo_C6NjTFK6IUnZLkLo1GAqK8fAzKQ-RkFlwgUPdsUTahM=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "/Users/sram/.ohos/config/default_hmosdemo_C6NjTFK6IUnZLkLo1GAqK8fAzKQ-RkFlwgUPdsUTahM=.p12",
+          "storePassword": "0000001BB6AFA34F3298B6DDBA1BDDB61447E3E74729DD071776E7ACA0DCAB2FFA537097D3FD14B2BE9EA9"
+        }
+      }
+    ],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "default",
+        "targetSdkVersion": "6.0.2(22)",
+        "compatibleSdkVersion": "6.0.0(20)",
+        "runtimeOS": "HarmonyOS",
+        "buildOption": {
+          "strictMode": {
+            "caseSensitiveCheck": true,
+            "useNormalizedOHMUrl": true
+          }
+        }
+      }
+    ],
+    "buildModeSet": [
+      {
+        "name": "debug"
+      },
+      {
+        "name": "release"
+      }
+    ],
+    "capabilities": [
+      {
+        "bundleName": "com.huawei.sramtest.clockdemo",
+        "config": [
+          {
+            "name": "Push Kit",
+            "capability": "com.huawei.service.push.base_service"
+          }
+        ]
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
+    }
+  ]
+}
