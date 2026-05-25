@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use p2p_core::frame::encode_data_frame;
+use p2p_core::frame::{encode_data_frame, encode_heartbeat_reply, parse_frame};
 use p2p_core::ice::agent::{HandleDataResult, IceAgent, IceAgentConfig};
 use p2p_core::ice::check_list::calc_candidate_priority;
 use p2p_core::sdp::{generate_sdp_offer, parse_sdp_answer};
@@ -17,7 +17,7 @@ use p2p_core::stun::client::{get_external_address, get_turn_relay_address};
 use p2p_core::ice::candidate::format_candidate_line;
 use p2p_core::types::{
     ConnectorMessage, IceCandidate, IceCandidateMessage, IceDataMessage,
-    IceSessionDescription, CandidateType, AF_INET, AF_INET6,
+    IceSessionDescription, CandidateType, AF_INET, AF_INET6, TYPE_HEARTBEAT,
 };
 use p2p_io::traits::{HttpTransport, Platform, UdpTransport};
 use p2p_sdk::connector::ConnectorClient;
@@ -106,6 +106,7 @@ struct Inner {
     ice_udp: Option<Arc<SyncUdpTransport>>,
     threads: ThreadHandles,
     connector_tx: Option<mpsc::Sender<OutgoingConnectorMsg>>,
+    heartbeat_interval: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +134,7 @@ static GLOBAL_INNER: once_cell::sync::Lazy<Arc<Mutex<Inner>>> =
             ice_udp: None,
             threads: ThreadHandles::new(),
             connector_tx: None,
+            heartbeat_interval: 0,
         }))
     });
 
@@ -411,6 +413,11 @@ pub fn connect(peer_id: &str, odid: &str, is_device: bool, heartbeat_interval: u
     let peer_id = peer_id.to_string();
     let odid = odid.to_string();
 
+    {
+        let mut guard = get_inner().lock().unwrap();
+        guard.heartbeat_interval = heartbeat_interval;
+    }
+
     thread::spawn(move || {
         let http = SyncHttpTransport::new();
 
@@ -427,7 +434,6 @@ pub fn connect(peer_id: &str, odid: &str, is_device: bool, heartbeat_interval: u
         // Step 3: ICE SDP negotiate
         ice_sdp_negotiate_bg_inner(&inner, &http, &peer_id, &odid);
 
-        let _ = heartbeat_interval;
         hilog::log_info(&format!("connect: negotiation started, heartbeat={}s", heartbeat_interval));
     });
     0
@@ -442,6 +448,7 @@ pub fn close() -> i32 {
     }
     inner.ice_agent = None;
     inner.ice_udp = None;
+    inner.heartbeat_interval = 0;
     drop(inner);
     napi_bridge::release_all_tsfn();
     0
@@ -1097,6 +1104,7 @@ fn start_ice_threads_inner(inner: &Arc<Mutex<Inner>>) {
     let tick_handle = thread::spawn(move || {
         let mut now_ms: u64 = 0;
         let mut last_state: String = String::new();
+        let mut last_heartbeat_ms: u64 = 0;
         while !stop_tick.load(Ordering::Relaxed) {
             now_ms += 50;
             let actions = {
@@ -1115,11 +1123,30 @@ fn start_ice_threads_inner(inner: &Arc<Mutex<Inner>>) {
                 }
             };
             let udp = { inner_tick.lock().unwrap().ice_udp.clone() };
-            if let Some(ref udp) = udp {
+            if let Some(ref udp) = &udp {
                 for act in &actions {
                     let _ = udp.send_to(&act.data, &act.target_ip, act.target_port);
                 }
             }
+
+            // Periodic heartbeat after ICE completed
+            let hb_interval_ms = { inner_tick.lock().unwrap().heartbeat_interval as u64 * 1000 };
+            if hb_interval_ms > 0 && last_state == "COMPLETED"
+                && now_ms.saturating_sub(last_heartbeat_ms) >= hb_interval_ms
+            {
+                last_heartbeat_ms = now_ms;
+                let hb = encode_heartbeat_reply();
+                let action = {
+                    let guard = inner_tick.lock().unwrap();
+                    guard.ice_agent.as_ref().and_then(|a| a.send_data(&hb))
+                };
+                if let Some(act) = action {
+                    if let Some(ref udp) = udp {
+                        let _ = udp.send_to(&act.data, &act.target_ip, act.target_port);
+                    }
+                }
+            }
+
             thread::sleep(Duration::from_millis(50));
         }
     });
@@ -1144,6 +1171,23 @@ fn start_ice_threads_inner(inner: &Arc<Mutex<Inner>>) {
                         let _ = udp.send_to(&act.data, &act.target_ip, act.target_port);
                     }
                     if let Some(app_data) = result.app_data {
+                        // Auto-reply heartbeat when interval is configured
+                        let hb_interval = { inner_recv.lock().unwrap().heartbeat_interval };
+                        if hb_interval > 0 {
+                            if let Some(parsed) = parse_frame(&app_data) {
+                                if parsed.frame_type == TYPE_HEARTBEAT {
+                                    let hb = encode_heartbeat_reply();
+                                    let action = {
+                                        let guard = inner_recv.lock().unwrap();
+                                        guard.ice_agent.as_ref().and_then(|a| a.send_data(&hb))
+                                    };
+                                    if let Some(act) = action {
+                                        let _ = udp.send_to(&act.data, &act.target_ip, act.target_port);
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
                         hilog::log_info(&format!("ICE app data: {} bytes", app_data.len()));
                         napi_bridge::fire_data(&app_data);
                     }

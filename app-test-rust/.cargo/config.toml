@@ -1,0 +1,3 @@
+[target.aarch64-unknown-linux-ohos]
+linker = "/Users/sram/Library/OpenHarmony/Sdk/20/native/llvm/bin/aarch64-unknown-linux-ohos-clang"
+ar = "/Users/sram/Library/OpenHarmony/Sdk/20/native/llvm/bin/llvm-ar"

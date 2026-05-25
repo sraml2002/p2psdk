@@ -342,10 +342,12 @@ fn fire_tsf(tsf: &AtomicPtr<c_void>, msg: String) {
 
 pub fn fire_state(state: &str) {
     fire_tsf(&TSFN_STATE, state.to_string());
+    crate::c_export::fire_c_state(state);
 }
 
 pub fn fire_log(msg: &str) {
     fire_tsf(&TSFN_LOG, msg.to_string());
+    crate::c_export::fire_c_log(msg);
 }
 
 pub fn fire_connector_state(connected: bool) {
@@ -353,6 +355,7 @@ pub fn fire_connector_state(connected: bool) {
 }
 
 pub fn fire_data(data: &[u8]) {
+    crate::c_export::fire_c_data(data);
     let func = TSFN_DATA.load(Ordering::Acquire);
     if func.is_null() { return; }
     let boxed = Box::new(data.to_vec());
