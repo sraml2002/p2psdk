@@ -139,7 +139,7 @@ pub extern "C" fn ppsdk_send(data: *const u8, len: usize) -> c_int {
         return -1;
     }
     let slice = unsafe { std::slice::from_raw_parts(data, len) };
-    crate::client_napi::send(slice)
+    crate::client_napi::send_data(slice)
 }
 
 /// Close connection and release resources.

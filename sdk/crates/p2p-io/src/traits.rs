@@ -124,3 +124,22 @@ pub trait Platform: Send + Sync {
             .as_millis() as u64
     }
 }
+
+/// Factory trait for creating platform I/O resources.
+///
+/// Injected internally by `P2pClient::init` so the SDK can create
+/// UDP sockets and HTTP clients internally without depending on a
+/// specific platform implementation.
+pub trait IoProvider: Send + Sync {
+    /// Create a UDP socket bound to `0.0.0.0:<port>` (IPv4).
+    fn create_udp(&self, port: u16) -> Result<Box<dyn UdpTransport>, IoError>;
+
+    /// Create a UDP socket bound to `[::]:<port>` (IPv6).
+    fn create_udp_v6(&self, port: u16) -> Result<Box<dyn UdpTransport>, IoError>;
+
+    /// Create an HTTP client.
+    fn create_http(&self) -> Box<dyn HttpTransport>;
+
+    /// Get local network IP addresses.
+    fn get_local_addresses(&self) -> Vec<String>;
+}

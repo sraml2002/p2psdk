@@ -1,6 +1,6 @@
 # P2P SDK (Rust) — API 参考文档
 
-> 最后更新: 2026-05-25
+> 最后更新: 2026-05-26
 
 ---
 
@@ -13,15 +13,15 @@
 | 方法 | 签名 | 说明 |
 |------|------|------|
 | `P2pClient::new()` | `-> Self` | 创建 P2pClient 实例 |
-| `init` | `(&mut self, config: &P2pConfig)` | 初始化 SDK 配置 |
-| `register_ids` | `(&self, http, app_id, user_id, odid, push_token) -> Result<IdsResponse, String>` | 向 IDS 注册本端信息 |
-| `query_ids` | `(&self, http, app_id, user_id) -> Result<IdsResponse, String>` | 查询 IDS 获取对端信息 |
-| `send_text` | `(&self, text: &str) -> Option<IceAction>` | 通过 P2P 通道发送文本 |
-| `send_data` | `(&self, data: &[u8]) -> Option<IceAction>` | 通过 P2P 通道发送二进制数据 |
-| `handle_incoming_udp` | `(&mut self, data, from_ip, from_port) -> HandleDataResult` | 处理收到的 UDP 数据，返回应用层数据 |
-| `parse_received` | `(data: &[u8]) -> Option<ParsedFrame>` | 解析收到的 P2P 帧（静态方法） |
-| `ice_state` | `(&self) -> Option<IceState>` | 获取当前 ICE 连接状态 |
-| `stop_ice` | `(&mut self)` | 停止 ICE，释放资源 |
+| `init` | `(&mut self, config: Config)` | 初始化 SDK 配置 |
+| `on_state_change` | `(&self, cb: Box<dyn Fn(IceState) + Send>)` | 注册 ICE 状态变化回调 |
+| `on_data` | `(&self, cb: Box<dyn Fn(Vec<u8>) + Send>)` | 注册数据接收回调（仅数据帧 payload） |
+| `register_ids` | `(&self, http, user_id, odid, push_token) -> Result<(), String>` | 向 IDS 注册本端信息 |
+| `query_ids` | `(&self, http, user_id) -> Result<IdsRecord, String>` | 查询 IDS 获取对端信息 |
+| `connect` | `(&self, peer_addr, odid, heartbeat_secs) -> Result<(), String>` | 一站式建立 P2P 通道（非阻塞，token 内部生成） |
+| `send_text` | `(&self, text: &str) -> Result<(), String>` | 通过 P2P 通道发送文本（自动编码+发送） |
+| `send_data` | `(&self, data: &[u8]) -> Result<(), String>` | 通过 P2P 通道发送二进制数据（自动发送） |
+| `close` | `(&self) -> Result<(), String>` | 停止 ICE 线程、关闭 UDP、释放资源 |
 
 ---
 
@@ -33,24 +33,56 @@
 
 创建 P2pClient 实例。
 
-##### `P2pClient::init(&mut self, config: &P2pConfig)`
+##### `P2pClient::init(&mut self, config: Config)`
 
-初始化 SDK 配置。
+初始化 SDK 配置，内部自动注入 IO 工厂，使 `connect` 等高级方法可用。
 
 **参数**：
 
 | 参数 | 类型 | 必选 | 说明 |
 |------|------|------|------|
-| config | `&P2pConfig` | 是 | SDK 配置，字段见下 |
+| config | `Config` | 是 | SDK 配置 |
 
-**P2pConfig 字段**：
+**Config 字段**：
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | ids_url | `String` | IDS 服务地址（`host:port`） |
 | nat_url | `String` | NAT 路由服务 URL |
 
-##### `P2pClient::register_ids(&self, http, app_id, user_id, odid, push_token) -> Result<IdsResponse, String>`
+##### `P2pClient::on_state_change(&self, cb: Box<dyn Fn(IceState) + Send>)`
+
+注册 ICE 状态变化回调。必须在 `connect` 之前调用。
+
+##### `P2pClient::on_data(&self, cb: Box<dyn Fn(Vec<u8>) + Send>)`
+
+注册数据接收回调，仅上报数据帧 payload（心跳帧由 SDK 内部处理）。必须在 `connect` 之前调用。
+
+##### `P2pClient::connect(&self, peer_addr: &str, odid: &str, heartbeat_interval_secs: u32) -> Result<(), String>`
+
+一站式建立 P2P 通道，内部自动完成 Token 生成 → NAT 路由 → 候选收集 → SDP 协商 → ICE 连通性检查。非阻塞，后台线程执行。连接结果通过 `on_state_change` 回调获取，接收数据通过 `on_data` 回调获取。
+
+##### `generate_token() -> String`
+
+生成访问 NAT 服务的 JWT Token（独立函数，非 P2pClient 方法）。Token 在编译时加密嵌入，运行时解密。失败返回空字符串。`connect` 内部自动调用此函数。
+
+##### `P2pClient::send_text(&self, text: &str) -> Result<(), String>`
+
+通过已建立的 P2P 通道发送文本。文本内部自动封装为 P2P 数据帧并通过内部 UDP 发送。
+
+**返回值**：`Ok(())` 成功，`Err(String)` 失败（无 ICE Agent / 无 Nominated Pair）
+
+##### `P2pClient::send_data(&self, data: &[u8]) -> Result<(), String>`
+
+通过已建立的 P2P 通道发送二进制数据，自动通过内部 UDP 发送。
+
+**返回值**：`Ok(())` 成功，`Err(String)` 失败
+
+##### `P2pClient::close(&self) -> Result<(), String>`
+
+停止 ICE tick/recv 线程，关闭 UDP socket，释放所有资源。
+
+##### `P2pClient::register_ids(&self, http, user_id, odid, push_token) -> Result<(), String>`
 
 向 IDS 服务注册本端信息。**同步阻塞 HTTP 调用**（10s 超时）。
 
@@ -59,14 +91,13 @@
 | 参数 | 类型 | 必选 | 说明 |
 |------|------|------|------|
 | http | `&dyn HttpTransport` | 是 | HTTP 传输实现（定义见 1.10） |
-| app_id | `&str` | 是 | 应用 ID |
 | user_id | `&str` | 是 | 用户 ID |
 | odid | `&str` | 是 | 本端设备标识 |
 | push_token | `&str` | 是 | 推送 Token |
 
-**返回值**：`Result<IdsResponse, String>`（IdsResponse 定义见 2.2）
+**返回值**：`Result<(), String>`
 
-##### `P2pClient::query_ids(&self, http, app_id, user_id) -> Result<IdsResponse, String>`
+##### `P2pClient::query_ids(&self, http, user_id) -> Result<IdsRecord, String>`
 
 查询 IDS 获取对端信息。**同步阻塞 HTTP 调用**（10s 超时）。
 
@@ -75,28 +106,11 @@
 | 参数 | 类型 | 必选 | 说明 |
 |------|------|------|------|
 | http | `&dyn HttpTransport` | 是 | HTTP 传输实现（定义见 1.10） |
-| app_id | `&str` | 是 | 应用 ID |
 | user_id | `&str` | 是 | 对端用户 ID |
 
-**返回值**：`Result<IdsResponse, String>`（IdsResponse 定义见 2.2）
+**返回值**：`Result<IdsRecord, String>`
 
-##### `P2pClient::send_text(&self, text: &str) -> Option<IceAction>`
-
-通过已建立的 P2P 通道发送文本。文本内部自动封装为 P2P 数据帧。
-
-**参数**：
-
-| 参数 | 类型 | 必选 | 说明 |
-|------|------|------|------|
-| text | `&str` | 是 | 待发送的文本内容 |
-
-**返回值**：`Some(IceAction)` 表示有数据待发送，`None` 表示尚未建立通道
-
-##### `P2pClient::send_data(&self, data: &[u8]) -> Option<IceAction>`
-
-通过已建立的 P2P 通道发送二进制数据。
-
-**参数**：
+##### `P2pClient::handle_incoming_udp(&self, data, from_ip, from_port) -> HandleDataResult`
 
 | 参数 | 类型 | 必选 | 说明 |
 |------|------|------|------|
@@ -634,7 +648,7 @@
 | `function` → TSFN | `napi_create_threadsafe_function` | `string` → `string` | `napi_create_string_utf8` |
 | — | — | `bool` → `boolean` | `napi_get_boolean` |
 
-**导出函数列表**：
+**导出函数列表**（共 21 个）：
 
 外部接口：
 
@@ -645,33 +659,32 @@
 | 3 | `queryIds(appId, userId)` | `(string, string) → IdsResponse` | 查询 IDS |
 | 4 | `connect(peerId, odid, isDevice?, heartbeatInterval?)` | `(string, string, boolean?, number?) → number` | 一站式建立 P2P 通道（非阻塞） |
 | 5 | `onStateChange(cb)` | `(function) → void` | 注册通道状态回调 |
-| 6 | `send(data)` | `(string \| ArrayBuffer) → number` | 发送数据 |
-| 7 | `onDataReceived(cb)` | `(function) → void` | 注册数据接收回调 |
-| 8 | `close()` | `() → number` | 关闭所有连接 |
+| 6 | `sendText(text)` | `(string) → number` | 发送文本（自动封装数据帧） |
+| 7 | `sendData(data)` | `(ArrayBuffer) → number` | 发送二进制数据 |
+| 8 | `onData(cb)` | `(function) → void` | 注册数据接收回调（仅数据帧 payload） |
+| 9 | `close()` | `() → number` | 关闭所有连接 |
 
 内部接口：
 
 | # | 导出名 | 签名 | 说明 |
 |---|--------|------|------|
-| 9 | `generateToken()` | `() → string` | 生成访问 NAT 服务的 JWT Token |
-| 10 | `gatherCandidates(token)` | `(string) → CandidateInfo` | 收集候选地址（同步阻塞） |
-| 11 | `iceSdpNegotiate(peerId, odid, isDevice?)` | `(string, string, boolean?) → number` | ICE SDP 协商（非阻塞） |
-| 12 | `encodeDataFrame(text)` | `(string) → ArrayBuffer` | 文本 → 数据帧 |
-| 13 | `encodeHeartbeatReply()` | `() → ArrayBuffer` | 心跳回复帧 |
-| 14 | `parseFrame(data)` | `(ArrayBuffer) → ParsedFrame` | 解析帧 |
-| 15 | `isStunMessage(data)` | `(ArrayBuffer) → boolean` | STUN 消息检测 |
-| 16 | `onLog(cb)` | `(function) → void` | 注册日志回调 |
-| 17 | `onConnectorStateChange(cb)` | `(function) → void` | 注册 Connector 状态回调（开发中） |
+| 10 | `generateToken()` | `() → string` | 生成访问 NAT 服务的 JWT Token |
+| 11 | `encodeDataFrame(text)` | `(string) → ArrayBuffer` | 文本 → 数据帧 |
+| 12 | `encodeHeartbeatReply()` | `() → ArrayBuffer` | 心跳回复帧 |
+| 13 | `parseFrame(data)` | `(ArrayBuffer) → ParsedFrame` | 解析帧 |
+| 14 | `isStunMessage(data)` | `(ArrayBuffer) → boolean` | STUN 消息检测 |
+| 15 | `onLog(cb)` | `(function) → void` | 注册日志回调 |
+| 16 | `onConnectorStateChange(cb)` | `(function) → void` | 注册 Connector 状态回调（开发中） |
 
 开发中接口：
 
 | # | 导出名 | 签名 | 说明 |
 |---|--------|------|------|
-| 18 | `connectConnector(url, id, auth)` | `(string, string, string) → number` | 连接 WS 信令服务器 |
-| 19 | `disconnectConnector()` | `() → number` | 断开 Connector |
-| 20 | `isConnectorRegistered()` | `() → number` | Connector 注册状态 |
-| 21 | `initiateIce(targetId)` | `(string) → number` | 通过 Connector 发起 ICE |
-| 22 | `stopIce()` | `() → number` | 停止 ICE Agent |
+| 17 | `connectConnector(url, id, auth)` | `(string, string, string) → number` | 连接 WS 信令服务器 |
+| 18 | `disconnectConnector()` | `() → number` | 断开 Connector |
+| 19 | `isConnectorRegistered()` | `() → number` | Connector 注册状态 |
+| 20 | `initiateIce(targetId)` | `(string) → number` | 通过 Connector 发起 ICE |
+| 21 | `stopIce()` | `() → number` | 停止 ICE Agent |
 
 ---
 
@@ -693,12 +706,13 @@ ppsdk.init(JSON.stringify({ idsUrl: '...', natUrl: '...' }))
 | 方法 | 签名 | 说明 |
 |------|------|------|
 | `init` | `(configJson: string): number` | 初始化 SDK |
+| `onStateChange` | `(cb: (state: string) => void): void` | 注册通道状态回调 |
+| `onData` | `(cb: (data: ArrayBuffer) => void): void` | 注册数据接收回调（仅数据帧 payload） |
 | `registerIds` | `(appId: string, userId: string, odid: string, pushToken: string): IdsResponse` | 注册到 IDS |
 | `queryIds` | `(appId: string, userId: string): IdsResponse` | 查询 IDS |
 | `connect` | `(peerId: string, odid: string, isDevice?: boolean, heartbeatInterval?: number): number` | 一站式建立 P2P 通道 |
-| `onStateChange` | `(cb: (state: string) => void): void` | 注册通道状态回调 |
-| `send` | `(data: string \| ArrayBuffer): number` | 发送数据 |
-| `onDataReceived` | `(cb: (data: ArrayBuffer) => void): void` | 注册数据接收回调 |
+| `sendText` | `(text: string): number` | 发送文本（自动封装数据帧） |
+| `sendData` | `(data: ArrayBuffer): number` | 发送二进制数据 |
 | `close` | `(): number` | 关闭所有连接 |
 
 ---
@@ -854,6 +868,7 @@ if (resp.data !== undefined && resp.data.length > 0) {
 | `CONNECTED` | 首个候选对成功 |
 | `COMPLETED` | 提名完成，通道可用 |
 | `FAILED` | 协商失败 |
+| `DISCONNECTED` | 心跳超时，连接断开 |
 | `CONNECTOR_REGISTERED` | Connector 注册成功 |
 | `CONNECTOR_DISCONNECTED` | Connector 断开 |
 
@@ -861,15 +876,27 @@ if (resp.data !== undefined && resp.data.length > 0) {
 
 ### 2.6 数据发送
 
-##### `send(data: string | ArrayBuffer): number`
+##### `sendText(text: string): number`
 
-通过已建立的 P2P 通道发送数据。传入 `string` 时内部自动封装为 P2P 数据帧，传入 `ArrayBuffer` 时直接发送原始字节。
+通过已建立的 P2P 通道发送文本，内部自动封装为 P2P 数据帧。
 
 **参数**：
 
 | 参数 | 类型 | 必选 | 说明 |
 |------|------|------|------|
-| data | string \| ArrayBuffer | 是 | 待发送数据。string 自动封装为数据帧，ArrayBuffer 直接发送原始字节 |
+| text | string | 是 | 待发送的文本内容 |
+
+**返回值**：`0` = 成功，负值 = 失败
+
+##### `sendData(data: ArrayBuffer): number`
+
+通过已建立的 P2P 通道发送二进制数据。
+
+**参数**：
+
+| 参数 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| data | ArrayBuffer | 是 | 待发送的二进制数据 |
 
 **返回值**：`0` = 成功，负值 = 失败
 
@@ -879,15 +906,15 @@ if (resp.data !== undefined && resp.data.length > 0) {
 
 ### 2.7 数据接收
 
-##### `onDataReceived(cb: (data: ArrayBuffer) => void): void`
+##### `onData(cb: (data: ArrayBuffer) => void): void`
 
-注册数据接收回调。P2P 通道建立后，收到对端应用数据时触发（STUN 协议消息已自动过滤）。
+注册数据接收回调。仅上报数据帧的 payload（心跳帧由 SDK 内部自动回复，不上报 App 层）。
 
 **参数**：
 
 | 参数 | 类型 | 必选 | 说明 |
 |------|------|------|------|
-| cb | `(data: ArrayBuffer) => void` | 是 | 数据接收回调函数 |
+| cb | `(data: ArrayBuffer) => void` | 是 | 数据接收回调函数，data 为数据帧 payload |
 
 ---
 
@@ -921,64 +948,7 @@ const token: string = ppsdk.generateToken()
 
 ---
 
-### 2.10 候选地址收集
-
-##### `gatherCandidates(p2pToken: string): CandidateInfo`
-
-**同步阻塞调用**，收集所有 ICE 候选地址。内部执行 HTTP 请求 + STUN/TURN 交互，耗时可达数秒。
-
-**参数**：
-
-| 参数 | 类型 | 必选 | 说明 |
-|------|------|------|------|
-| p2pToken | string | 是 | 访问 NAT 服务的 JWT Token（通过 `generateToken()` 获取） |
-
-**返回值**：`CandidateInfo`
-
-**CandidateInfo**:
-
-| 属性 | 类型 | 说明 |
-|------|------|------|
-| `candidateLines` | `string[]` | 所有候选行（host + srflx + relay） |
-| `localAddresses` | `string[]` | 本机 IP 地址列表 |
-| `stunExternalIp` | `string` | STUN 公网映射 IP |
-| `stunExternalPort` | `string` | STUN 公网映射端口 |
-| `turnRelayIp` | `string` | TURN 中继 IP |
-| `turnRelayPort` | `string` | TURN 中继端口 |
-
-```typescript
-const info: CandidateInfo = ppsdk.gatherCandidates(token)
-```
-
----
-
-### 2.11 ICE SDP 协商
-
-##### `iceSdpNegotiate(peerId: string, odid: string, isDevice?: boolean): number`
-
-发起 ICE SDP 协商，建立 P2P 通道。适用于端-云服务和端-端两种场景（端-端场景预留，当前仅实现端-云服务）。非阻塞，后台线程执行。
-
-**参数**：
-
-| 参数 | 类型 | 必选 | 说明 |
-|------|------|------|------|
-| peerId | string | 是 | 从 IDS 查询到的对端 token 值。云服务场景为 `ip:port`，端-端场景为 Push Token |
-| odid | string | 是 | 本端设备标识，写入 SDP `o=` 字段供对端识别 |
-| isDevice | boolean | 否 | `false`（缺省）= 对端为云服务（ICE-Lite），`true` = 对端为 App（ICE-Full，预留） |
-
-**内部流程**：
-
-1. 从已有 ICE Agent 获取本地候选
-2. 生成 SDP offer，`o=` 字段写入本端 odid
-3. HTTP POST `http://{peerId}/api/ice/offer`（Content-Type: `application/sdp`）
-4. 解析 SDP answer
-5. 启动 ICE 线程进行连通性检查
-
-返回 `0` 表示参数正确并已启动后台线程，实际连接结果通过 `onStateChange` 回调获取。
-
----
-
-### 2.12 帧编解码
+### 2.10 帧编解码
 
 ##### `encodeDataFrame(text: string): ArrayBuffer`
 

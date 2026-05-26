@@ -426,19 +426,6 @@ extern "C" fn generate_token(_env: NapiEnv, _info: NapiCallbackInfo) -> NapiValu
     return_string(_env, &token)
 }
 
-extern "C" fn gather_candidates(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
-    let (argc, args) = unsafe { get_cb_args(env, info, 1) };
-    if argc < 1 {
-        return return_json_object(env, "{\"error\":\"missing p2p_token\"}");
-    }
-    let p2p_token = match read_napi_string(env, args[0]) {
-        Some(s) => s,
-        None => return return_json_object(env, "{\"error\":\"invalid token\"}"),
-    };
-    let result = crate::client_napi::gather_candidates(&p2p_token);
-    return_json_object(env, &result)
-}
-
 extern "C" fn connect_connector(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
     let (argc, args) = unsafe { get_cb_args(env, info, 3) };
     if argc < 3 {
@@ -488,21 +475,30 @@ extern "C" fn stop_ice(env: NapiEnv, _info: NapiCallbackInfo) -> NapiValue {
     return_int32(env, code)
 }
 
-extern "C" fn send(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+extern "C" fn send_text_napi(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
     let (argc, args) = unsafe { get_cb_args(env, info, 1) };
     if argc < 1 {
         return return_int32(env, -1);
     }
-    // Try ArrayBuffer first, fall back to string
-    if let Some(bytes) = read_napi_arraybuffer(env, args[0]) {
-        let code = crate::client_napi::send(&bytes);
-        return return_int32(env, code);
+    let text = match read_napi_string(env, args[0]) {
+        Some(s) => s,
+        None => return return_int32(env, -1),
+    };
+    let code = crate::client_napi::send_text(&text);
+    return_int32(env, code)
+}
+
+extern "C" fn send_data_napi(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    let (argc, args) = unsafe { get_cb_args(env, info, 1) };
+    if argc < 1 {
+        return return_int32(env, -1);
     }
-    if let Some(text) = read_napi_string(env, args[0]) {
-        let code = crate::client_napi::send_text(&text);
-        return return_int32(env, code);
-    }
-    return_int32(env, -1)
+    let data = match read_napi_arraybuffer(env, args[0]) {
+        Some(b) => b,
+        None => return return_int32(env, -1),
+    };
+    let code = crate::client_napi::send_data(&data);
+    return_int32(env, code)
 }
 
 extern "C" fn register_ids(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
@@ -547,24 +543,6 @@ extern "C" fn query_ids(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
     return_json_object(env, &result)
 }
 
-extern "C" fn ice_sdp_negotiate(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
-    let (argc, args) = unsafe { get_cb_args(env, info, 3) };
-    if argc < 2 {
-        return return_int32(env, -1);
-    }
-    let peer_id = match read_napi_string(env, args[0]) {
-        Some(s) => s,
-        None => return return_int32(env, -1),
-    };
-    let odid = match read_napi_string(env, args[1]) {
-        Some(s) => s,
-        None => return return_int32(env, -1),
-    };
-    let is_device = argc >= 3 && read_napi_bool(env, args[2]);
-    let code = crate::client_napi::ice_sdp_negotiate(&peer_id, &odid, is_device);
-    return_int32(env, code)
-}
-
 extern "C" fn connect(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
     let (argc, args) = unsafe { get_cb_args(env, info, 4) };
     if argc < 2 {
@@ -598,10 +576,10 @@ extern "C" fn on_state_change(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue
     return_int32(env, code)
 }
 
-extern "C" fn on_data_received(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+extern "C" fn on_data(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
     let (argc, args) = unsafe { get_cb_args(env, info, 1) };
     if argc < 1 { return return_int32(env, -1); }
-    let code = unsafe { register_tsf(env, args[0], b"onDataReceived\0", call_js_data, &TSFN_DATA) };
+    let code = unsafe { register_tsf(env, args[0], b"onData\0", call_js_data, &TSFN_DATA) };
     return_int32(env, code)
 }
 
@@ -726,20 +704,19 @@ extern "C" fn is_stun_message(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue
 extern "C" fn init_module(env: NapiEnv, exports: NapiValue) -> NapiValue {
     hilog::log_info("INIT_MODULE: called");
 
-    let descriptors: [NapiPropertyDescriptor; 22] = [
+    let descriptors: [NapiPropertyDescriptor; 21] = [
         // External interfaces
         prop_desc!("init", init),
         prop_desc!("registerIds", register_ids),
         prop_desc!("queryIds", query_ids),
         prop_desc!("connect", connect),
         prop_desc!("onStateChange", on_state_change),
-        prop_desc!("send", send),
-        prop_desc!("onDataReceived", on_data_received),
+        prop_desc!("sendText", send_text_napi),
+        prop_desc!("sendData", send_data_napi),
+        prop_desc!("onData", on_data),
         prop_desc!("close", close),
         // Internal interfaces
         prop_desc!("generateToken", generate_token),
-        prop_desc!("gatherCandidates", gather_candidates),
-        prop_desc!("iceSdpNegotiate", ice_sdp_negotiate),
         prop_desc!("encodeDataFrame", encode_data_frame),
         prop_desc!("encodeHeartbeatReply", encode_heartbeat_reply),
         prop_desc!("parseFrame", parse_frame),

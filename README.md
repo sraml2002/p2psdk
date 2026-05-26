@@ -1,6 +1,6 @@
 # P2P SDK (Rust)
 
-P2P SDK 的全 Rust 实现，用于 HarmonyOS 设备端 P2P 通信。提供两种集成方式：ArkTS 应用通过 `libppsdk.so` 直接调用，Rust 程序通过 SDK crate 编译为单一可执行文件。支持一键建链（init → registerIds → queryIds → p2pConnect），内部自动完成 NAT 路由、候选收集、SDP 协商、ICE 建立。
+P2P SDK 的全 Rust 实现，用于 HarmonyOS 设备端 P2P 通信。提供两种集成方式：ArkTS 应用通过 `libppsdk.so` 直接调用，Rust 程序通过 SDK crate 编译为单一可执行文件。支持一键建链（init → registerIds → queryIds → connect），内部自动完成 NAT 路由、候选收集、SDP 协商、ICE 建立。
 
 ## 项目结构
 
@@ -45,11 +45,11 @@ p2psdk_rust/
 
 ---
 
-## 1. Rust应用集成
+## 1. Rust 应用集成
 
-命令行 P2P 建链程序，直接基于 SDK crate 源码编译为可执行文件，实现与对端建链 + 聊天功能，通过配置文件设定对端 URL 信息。
+Rust 程序直接依赖 SDK crate，编译为单一可执行文件。
 
-### 构建配置
+### 1.1 构建配置
 
 线下获取访问 NAT 服务的 JWT Token，保存为文件，并将文件绝对路径写入项目根目录的 `build.jwt.path`：
 
@@ -58,7 +58,7 @@ p2psdk_rust/
 /path/to/your/jwt-token
 ```
 
-### 构建
+### 1.2 构建
 
 ```bash
 # 构建 OHOS 版本（默认，交叉编译到 aarch64-unknown-linux-ohos）
@@ -70,21 +70,7 @@ bash build-rust-demo.sh --target mac
 
 产出目录：`app-test-rust/dist/`，包含 `app-test-rust` 可执行文件和 `config.example.json`。
 
-### 运行配置
-
-```json
-{
-  "idsUrl": "{IDS服务的URL}",
-  "natUrl": "{NAT服务的URL}",
-  "appId": "{宿主AppId}",
-  "userId": "{宿主App的用户ID}",
-  "odid": "{宿主App ODID}"
-}
-```
-
-运行前复制 `config.example.json` 为 `config.json`，填入真实服务地址。
-
-### 运行
+### 1.3 运行
 
 **OHOS 设备：**
 
@@ -103,122 +89,112 @@ cp config.example.json config.json  # 编辑填入真实配置
 ./app-test-rust config.json
 ```
 
-### 运行流程
+### 1.4 代码示例
 
-一键建链流程：`init → registerIds → queryIds → p2pConnect`，其中 `p2pConnect` 内部自动完成 NAT 路由解析 → 候选收集 → SDP 协商 → ICE 建立。
+> 完整可运行的 Demo 见 `app-test-rust/src/main.rs`，以下为精简版，可直接复制为 `main.rs` 使用。
 
+**Cargo.toml 依赖**：
+
+```toml
+[dependencies]
+p2p-sdk = { path = "../sdk/crates/p2p-sdk" }
+p2p-tokio = { path = "../sdk/crates/p2p-tokio" }
 ```
-[1/3] 注册 IDS... 成功
-[2/3] 查询 IDS... 找到对端: 81.71.29.250:34848
-[3/3] 建立 P2P 连接... 等待 ICE 协商...
-[ICE] CONNECTING
-[ICE] CONNECTED
-已连接，输入消息按回车发送，/quit 退出
-```
 
-### 交互命令
-
-- 输入文本按回车发送消息
-- `/status` 查看 ICE 连接状态
-- `/quit` 退出
-
-### 代码示例
+**main.rs**：
 
 ```rust
-use p2p_sdk::P2pClient;
+use std::sync::mpsc;
+use std::time::Duration;
 
-// 初始化（配置从 config.json 读取）
-let mut client = P2pClient::new();
-client.init(config);
+use p2p_sdk::{Config, IceState, P2pClient};
+use p2p_tokio::SyncHttpTransport;
 
-// 注册 + 查询 IDS
-client.register_ids(&http, &user_id, &odid, "")?;
-let peer = client.query_ids(&http, &user_id)?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config {
+        ids_url: "{IDS服务URL}".into(),
+        nat_url: "{NAT服务URL}".into(),
+    };
+    let app_id = "{AppId}";
+    let user_id = "{用户ID}";
+    let odid = "{设备ODID}";
 
-// 一键建链（内部自动完成 NAT 路由 → 候选收集 → SDP 协商 → ICE 建立）
-let runner = IceRunner::connect(&token, &config, &peer.token)?;
+    // 初始化
+    let mut client = P2pClient::new();
+    client.init(config);
 
-// 发送文本
-runner.send_text("Hello P2P")?;
+    // 注册回调（connect 之前）
+    let (state_tx, state_rx) = mpsc::channel::<IceState>();
+    client.on_state_change(Box::new(move |state: IceState| {
+        let _ = state_tx.send(state);
+    }));
+    client.on_data(Box::new(|payload: Vec<u8>| {
+        println!("[对端] {}", String::from_utf8_lossy(&payload));
+    }));
 
-// 接收对端消息（通过 channel 异步回调）
-if let Ok(text) = data_rx.recv_timeout(Duration::from_secs(5)) {
-    println!("[对端] {}", text);
+    // 注册 + 查询 IDS
+    let http = SyncHttpTransport::new();
+    client.register_ids(&http, app_id, user_id, odid, "")?;
+    let peer = client.query_ids(&http, app_id, user_id)?;
+    if peer.token.is_empty() {
+        return Err("未找到对端".into());
+    }
+    println!("对端地址: {}", peer.token);
+
+    // 一键建链（token 由 SDK 内部自动生成，非阻塞后台线程执行）
+    client.connect(&peer.token, odid, 30)?;
+
+    // 等待 ICE 完成
+    loop {
+        match state_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(IceState::Completed | IceState::Connected) => {
+                println!("已连接");
+                break;
+            }
+            Ok(IceState::Failed) => return Err("ICE 协商失败".into()),
+            Ok(IceState::Disconnected) => return Err("连接断开".into()),
+            Ok(_) => continue,
+            Err(_) => return Err("ICE 协商超时".into()),
+        }
+    }
+
+    // 发送文本
+    client.send_text("Hello P2P")?;
+
+    // 断开连接
+    client.close()?;
+    Ok(())
 }
-
-// 断开连接
-runner.stop();
 ```
 
 ---
 
-## 2. SDK 概览
+## 2. ArkTS 应用集成
 
-### Rust Crate 依赖关系
+第三方 HarmonyOS 应用通过 `libppsdk.so` 集成 P2P SDK。
 
-```
-p2p-napi (→ libppsdk.so)
-  ├── p2p-sdk (SDK 门面)
-  │     ├── p2p-core (协议核心)
-  │     │     └── dimpl (DER 编码)
-  │     └── p2p-io (I/O traits)
-  ├── p2p-tokio (同步 I/O)
-  │     └── p2p-io (I/O traits)
-  └── p2p-core (直接使用 STUN/SDP/Frame)
-
-app-test-rust (→ 单一可执行文件)
-  ├── p2p-sdk (SDK 门面)
-  ├── p2p-tokio (同步 I/O)
-  ├── p2p-core (协议核心)
-  └── p2p-io (I/O traits)
-```
-
-| Crate | 职责 |
-|-------|------|
-| **p2p-core** | Sans-IO 协议核心：ICE Agent (RFC 8445)、STUN/TURN 编解码、SDP 生成/解析、P2P 数据帧 |
-| **p2p-io** | 平台抽象 traits：`UdpTransport`、`HttpTransport`、`SignalingTransport`、`Platform` |
-| **p2p-tokio** | 基于标准库的同步实现：`std::net::UdpSocket`、`reqwest::blocking`、`tungstenite` WebSocket |
-| **p2p-sdk** | 高层 SDK 门面：`P2pClient` 统一编排 ICE/STUN/TURN/IDS/Connector 全流程 |
-| **p2p-napi** | Raw NAPI FFI 桥接：通过 `.init_array` 自动注册，ThreadsafeFunction 回调到 ArkTS；同时导出 C ABI 供非 NAPI 消费者使用 |
-
-### 开发环境
-
-| 工具 | 版本要求 | 说明 |
-|------|---------|------|
-| Rust | stable | `rustup` 安装 |
-| OHOS NDK | API 20+ | HarmonyOS OpenHarmony SDK，包含 `aarch64-linux-ohos-clang` 链接器 |
-| DevEco Studio | 5.0+ | HarmonyOS 应用开发 IDE |
-
-NDK 路径配置在 `sdk/.cargo/config.toml` 中，默认值为 `~/Library/OpenHarmony/Sdk/20/native/llvm/bin/`。如果 NDK 安装位置或 API 版本不同，需修改此文件。
-
----
-
-## 3. 构建 libppsdk.so
+### 2.1 构建 libppsdk.so
 
 构建前需配置 JWT Token（同第 1 部分），并将 Token 文件绝对路径写入 `build.jwt.path`。
 
-### 方式一：DevEco Studio 构建
+**方式一：DevEco Studio 构建**
 
 在 DevEco Studio 中打开 `app-test-hmos/` 项目，手动点击 Build > Build Hap(s)/APP(s)。构建过程中，自定义 hvigor 插件（`entry/hvigorfile.ts`）会自动调用 `build-arkts-napi-so.sh` 完成 Rust 编译和 .so 复制。
 
-### 方式二：手动编译 .so
+**方式二：手动编译 .so**
 
 ```bash
 bash build-arkts-napi-so.sh
 ```
 
----
+### 2.2 集成SDK&构建鸿蒙App
 
-## 4. ArkTS应用集成
-
-第三方 HarmonyOS 应用集成 P2P SDK 只需 **2 个文件**：
+集成 P2P SDK 只需 **2 个文件**：
 
 | 文件 | 放置位置 | 说明 |
 |------|---------|------|
 | `libppsdk.so` | `entry/libs/arm64-v8a/` | Rust 编译产物 |
 | `index.d.ts` | `entry/src/main/cpp/types/libppsdk/` | 类型声明文件 |
-
-#### 集成步骤
 
 **1. 复制文件**
 
@@ -238,36 +214,128 @@ set_target_properties(ppsdk PROPERTIES
 )
 ```
 
-**3. 代码示例**
+### 2.3 代码示例
+
+> 以下为完整可运行的页面组件，可直接复制为 `P2pPage.ets` 使用。完整 Demo 见 `app-test-hmos/entry/src/main/ets/pages/IdsPage.ets`。
 
 ```typescript
+import { util } from '@kit.ArkTS'
+import { deviceInfo } from '@kit.BasicServicesKit'
 import ppsdk from 'libppsdk.so'
 
-// 初始化（配置从 config.json 读取）
-ppsdk.init(JSON.stringify(config))
+interface IdsResponse {
+  code: number
+  message: string
+  error: string | undefined
+  data: IdsRecord[] | undefined
+}
 
-// 注册 + 查询 IDS
-const resp: IdsResponse = ppsdk.registerIds(appId, userId, odid, pushToken)
-const peer: IdsResponse = ppsdk.queryIds(appId, userId)
+interface IdsRecord {
+  appId: string
+  userId: string
+  type: string
+  odid: string
+  token: string
+}
 
-// 一键建链（内部自动完成 NAT 路由 → 候选收集 → SDP 协商 → ICE 建立）
-ppsdk.connect(signalingUrl, odid)
+@Entry
+@Component
+struct P2pPage {
+  @State connected: boolean = false
+  @State inputText: string = ''
 
-// 发送文本
-ppsdk.send(ppsdk.encodeDataFrame('Hello P2P'))
+  aboutToAppear(): void {
+    // TODO: 替换为真实服务地址
+    ppsdk.init(JSON.stringify({
+      idsUrl: '{IDS服务的URL}',
+      natUrl: '{NAT服务的URL}',
+    }))
 
-// 接收对端消息（通过回调）
-ppsdk.onDataReceived((data: ArrayBuffer): void => {
-  const text: string = new util.TextDecoder().decodeToString(new Uint8Array(data))
-})
+    // 注册回调（connect 之前）
+    ppsdk.onStateChange((state: string): void => {
+      if (state === 'COMPLETED' || state === 'CONNECTED') {
+        this.connected = true
+      } else if (state === 'FAILED' || state === 'DISCONNECTED') {
+        this.connected = false
+      }
+    })
+    ppsdk.onData((data: ArrayBuffer): void => {
+      const text: string = new util.TextDecoder().decodeToString(new Uint8Array(data))
+      console.info('[对端] ' + text)
+    })
+  }
 
-// 断开连接
-ppsdk.close()
+  aboutToDisappear(): void {
+    ppsdk.close()
+  }
+
+  doConnect(): void {
+    // TODO: 替换为真实配置
+    const appId: string = '{宿主AppId}'
+    const userId: string = '{宿主App的用户ID}'
+    const odid: string = deviceInfo.ODID || userId
+
+    // 注册 IDS
+    const regResp: IdsResponse = ppsdk.registerIds(appId, userId, odid, '')
+    if (regResp.error !== undefined && regResp.error.length > 0) {
+      console.error('注册失败: ' + regResp.error)
+      return
+    }
+
+    // 查询 IDS，提取 service 记录的 token 作为对端地址
+    const queryResp: IdsResponse = ppsdk.queryIds(appId, userId)
+    let peerAddr: string = ''
+    if (queryResp.data !== undefined) {
+      for (let i = 0; i < queryResp.data.length; i++) {
+        const record: IdsRecord = queryResp.data[i]
+        if (record.type === 'service' && record.token.length > 0) {
+          peerAddr = record.token
+          break
+        }
+      }
+    }
+    if (peerAddr.length === 0) {
+      console.error('未找到对端')
+      return
+    }
+
+    // 一键建链（非阻塞，结果通过 onStateChange 回调获取）
+    ppsdk.connect(peerAddr, odid)
+  }
+
+  build(): void {
+    Column({ space: 12 }) {
+      Button(this.connected ? '已连接' : '注册 + 查询 + 建链')
+        .width('90%')
+        .enabled(!this.connected)
+        .onClick(() => {
+          this.doConnect()
+        })
+
+      TextInput({ text: this.inputText, placeholder: '输入消息...' })
+        .width('90%')
+        .onChange((value: string): void => {
+          this.inputText = value
+        })
+
+      Button('发送')
+        .width('90%')
+        .enabled(this.connected && this.inputText.length > 0)
+        .onClick(() => {
+          ppsdk.sendText(this.inputText)
+          this.inputText = ''
+        })
+    }
+    .width('100%')
+    .height('100%')
+    .padding(20)
+  }
+}
 ```
 
-> **注意**：ArkTS 严格模式下，`ppsdk` 的返回值为 `any` 类型，所有接收返回值的变量必须显式标注类型（如 `const info: CandidateInfo = ppsdk.gatherCandidates(token)`），否则触发 `arkts-no-any-unknown` 编译错误。
+> **注意**：ArkTS 严格模式下，`ppsdk` 的返回值为 `any` 类型，所有接收返回值的变量必须显式标注类型（如 `const resp: IdsResponse = ppsdk.registerIds(...)`），否则触发 `arkts-no-any-unknown` 编译错误。
 
-#### 需要的权限
+### 2.4 需要的权限
 
 ```json
 "requestPermissions": [
@@ -279,7 +347,52 @@ ppsdk.close()
 
 ---
 
-## 5. 技术选型
+## 3. SDK 概览
+
+### 3.1 Rust Crate 依赖关系
+
+```
+p2p-napi (→ libppsdk.so)
+  ├── p2p-sdk (SDK 门面)
+  │     ├── p2p-core (协议核心)
+  │     │     └── dimpl (DER 编码)
+  │     ├── p2p-io (I/O traits)
+  │     └── p2p-tokio (同步 I/O，内部自动注入)
+  ├── p2p-tokio (同步 I/O)
+  │     ├── p2p-core (协议核心)
+  │     └── p2p-io (I/O traits)
+  └── p2p-core (直接使用 STUN/SDP/Frame)
+
+app-test-rust (→ 单一可执行文件)
+  ├── p2p-sdk (SDK 门面)
+  │     ├── p2p-core (协议核心)
+  │     ├── p2p-io (I/O traits)
+  │     └── p2p-tokio (同步 I/O，内部自动注入)
+  ├── p2p-tokio (同步 I/O，直接使用 HttpTransport)
+  └── p2p-io (I/O traits)
+```
+
+| Crate | 职责 |
+|-------|------|
+| **p2p-core** | Sans-IO 协议核心：ICE Agent (RFC 8445)、STUN/TURN 编解码、SDP 生成/解析、P2P 数据帧 |
+| **p2p-io** | 平台抽象 traits：`UdpTransport`、`HttpTransport`、`SignalingTransport`、`Platform` |
+| **p2p-tokio** | 基于标准库的同步实现：`std::net::UdpSocket`、`reqwest::blocking`、`tungstenite` WebSocket |
+| **p2p-sdk** | 高层 SDK 门面：`P2pClient` 统一编排 ICE/STUN/TURN/IDS/Connector 全流程 |
+| **p2p-napi** | Raw NAPI FFI 桥接：通过 `.init_array` 自动注册，ThreadsafeFunction 回调到 ArkTS；同时导出 C ABI 供非 NAPI 消费者使用 |
+
+### 3.2 开发环境
+
+| 工具 | 版本要求 | 说明 |
+|------|---------|------|
+| Rust | stable | `rustup` 安装 |
+| OHOS NDK | API 20+ | HarmonyOS OpenHarmony SDK，包含 `aarch64-linux-ohos-clang` 链接器 |
+| DevEco Studio | 5.0+ | HarmonyOS 应用开发 IDE |
+
+NDK 路径配置在 `sdk/.cargo/config.toml` 中，默认值为 `~/Library/OpenHarmony/Sdk/20/native/llvm/bin/`。如果 NDK 安装位置或 API 版本不同，需修改此文件。
+
+---
+
+## 4. 技术选型
 
 | 决策 | 原因 |
 |------|------|

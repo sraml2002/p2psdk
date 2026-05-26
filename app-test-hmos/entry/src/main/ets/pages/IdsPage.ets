@@ -1,11 +1,10 @@
 /**
- * IdsPage — IDS + HSService P2P Chat page.
+ * IdsPage — IDS P2P Chat page.
  *
- * Four-step flow:
+ * Three-step flow:
  *   Step 1: Register to IDS
- *   Step 2: Gather host candidates
- *   Step 3: Query IDS for HSService
- *   Step 4: Send SDP offer, negotiate ICE, start chat
+ *   Step 2: Query IDS for HSService
+ *   Step 3: connect (one-stop P2P) → chat
  */
 import { router } from '@kit.ArkUI'
 import { hilog } from '@kit.PerformanceAnalysisKit'
@@ -14,15 +13,6 @@ import { deviceInfo } from '@kit.BasicServicesKit'
 import { util } from '@kit.ArkTS'
 import ppsdk from 'libppsdk.so'
 import { loadAppConfig, AppConfig } from '../sdk/AppConfig'
-
-interface CandidateInfo {
-  candidateLines: string[]
-  localAddresses: string[]
-  stunExternalIp: string
-  stunExternalPort: string
-  turnRelayIp: string
-  turnRelayPort: string
-}
 
 interface IdsResponse {
   code: number
@@ -39,14 +29,6 @@ interface IdsRecord {
   token: string
 }
 
-interface ParsedFrame {
-  type: number
-  payload: ArrayBuffer
-}
-
-const TAG = 'IdsPage'
-const HEARTBEAT_TIMEOUT_MS = 60000
-
 interface ChatMessage {
   id: string
   text: string
@@ -58,8 +40,6 @@ interface ChatMessage {
 @Component
 struct IdsPage {
   @State step: number = 1
-  @State gatheringStatus: string = ''
-  @State candidates: string[] = []
   @State idsStatus: string = ''
   @State signalingUrl: string = ''
   @State iceStatus: string = 'NEW'
@@ -68,14 +48,11 @@ struct IdsPage {
   @State chatMessages: ChatMessage[] = []
   @State inputText: string = ''
   @State logs: string[] = []
-  @State lastHeartbeat: string = ''
-  @State isGathering: boolean = false
   @State isQuerying: boolean = false
   @State isConnecting: boolean = false
   @State isRegistering: boolean = false
   @State registerStatus: string = ''
 
-  private heartbeatTimerId: number = -1
   private config: AppConfig = { idsUrl: '', natUrl: '', appId: '', userId: '' }
 
   aboutToAppear(): void {
@@ -91,30 +68,35 @@ struct IdsPage {
       if (state === 'COMPLETED' || state === 'CONNECTED') {
         this.connected = true
         this.isConnecting = false
-        this.resetHeartbeatTimer()
         this.appendLog('P2P channel established!')
       } else if (state === 'FAILED') {
         this.connected = false
         this.isConnecting = false
+      } else if (state === 'DISCONNECTED') {
+        this.connected = false
+        this.disconnected = true
+        this.isConnecting = false
+        this.appendLog('Connection lost')
       }
     })
     ppsdk.onLog((msg: string): void => {
       this.appendLog(msg)
     })
-    ppsdk.onDataReceived((data: ArrayBuffer): void => {
-      this.handleChatData(data)
+    ppsdk.onData((data: ArrayBuffer): void => {
+      const payloadBytes = new Uint8Array(data)
+      const text: string = new util.TextDecoder().decodeToString(payloadBytes)
+      this.appendLog(`Data received: ${text}`)
+      const msg: ChatMessage = {
+        id: `${Date.now()}`,
+        text: text,
+        isSelf: false,
+        time: new Date().toLocaleTimeString(),
+      }
+      this.chatMessages = [...this.chatMessages, msg]
     })
   }
 
   aboutToDisappear(): void {
-    this.cleanup()
-  }
-
-  private cleanup(): void {
-    if (this.heartbeatTimerId !== -1) {
-      clearTimeout(this.heartbeatTimerId)
-      this.heartbeatTimerId = -1
-    }
     ppsdk.close()
   }
 
@@ -124,19 +106,6 @@ struct IdsPage {
     if (this.logs.length > 200) {
       this.logs = this.logs.slice(-200)
     }
-  }
-
-  private resetHeartbeatTimer(): void {
-    if (this.heartbeatTimerId !== -1) {
-      clearTimeout(this.heartbeatTimerId)
-    }
-    this.lastHeartbeat = new Date().toLocaleTimeString()
-    this.heartbeatTimerId = setTimeout(() => {
-      this.appendLog('Heartbeat timeout — connection lost')
-      this.disconnected = true
-      this.connected = false
-      this.heartbeatTimerId = -1
-    }, HEARTBEAT_TIMEOUT_MS)
   }
 
   // ── Step 1: Register to IDS ─────────────────────────────────────
@@ -170,38 +139,12 @@ struct IdsPage {
     })
   }
 
-  // ── Step 2: Gather candidates ──────────────────────────────────────
-
-  doGatherCandidates(): void {
-    this.isGathering = true
-    this.gatheringStatus = 'Gathering...'
-    this.candidates = []
-    this.appendLog('Step 2: Gathering candidates')
-
-    const token: string = ppsdk.generateToken()
-    if (token.length === 0) {
-      this.gatheringStatus = 'Failed: token not available'
-      this.isGathering = false
-      return
-    }
-
-    try {
-      const info: CandidateInfo = ppsdk.gatherCandidates(token)
-      this.candidates = info.candidateLines
-      this.gatheringStatus = `Done (${info.candidateLines.length} candidates)`
-    } catch (e) {
-      this.gatheringStatus = 'Failed'
-      this.appendLog(`Gather error: ${JSON.stringify(e)}`)
-    }
-    this.isGathering = false
-  }
-
-  // ── Step 3: Query IDS ─────────────────────────────────────────────
+  // ── Step 2: Query IDS ─────────────────────────────────────────────
 
   doQueryIds(): void {
     this.isQuerying = true
     this.idsStatus = 'Querying...'
-    this.appendLog(`Step 3: Query IDS ${this.config.idsUrl}/${this.config.appId}/${this.config.userId}`)
+    this.appendLog(`Step 2: Query IDS ${this.config.idsUrl}/${this.config.appId}/${this.config.userId}`)
 
     try {
       const resp: IdsResponse = ppsdk.queryIds(this.config.appId, this.config.userId)
@@ -230,16 +173,17 @@ struct IdsPage {
     this.isQuerying = false
   }
 
-  // ── Step 4: Initiate P2P connection ───────────────────────────────
+  // ── Step 3: Initiate P2P connection ───────────────────────────────
 
   doConnect(): void {
     this.isConnecting = true
     this.iceStatus = 'CONNECTING'
     this.connected = false
     this.disconnected = false
-    this.appendLog('Step 4: Initiating P2P connection')
+    this.appendLog('Step 3: Initiating P2P connection')
 
-    const code: number = ppsdk.iceSdpNegotiate(this.signalingUrl, deviceInfo.ODID || this.config.userId)
+    const odid: string = deviceInfo.ODID || this.config.userId
+    const code: number = ppsdk.connect(this.signalingUrl, odid)
     if (code !== 0) {
       this.iceStatus = 'FAILED'
       this.appendLog('Connect failed')
@@ -247,34 +191,7 @@ struct IdsPage {
     }
   }
 
-  // ── Chat data handling ────────────────────────────────────────────
-
-  private handleChatData(data: ArrayBuffer): void {
-    const frame: ParsedFrame = ppsdk.parseFrame(data)
-    if (frame.type === 0) {
-      this.appendLog('Invalid P2P frame received')
-      return
-    }
-
-    if (frame.type === 1) {
-      this.appendLog('Heartbeat received, replying')
-      this.resetHeartbeatTimer()
-      const reply: ArrayBuffer = ppsdk.encodeHeartbeatReply()
-      ppsdk.send(reply)
-    } else if (frame.type === 2) {
-      const payloadBytes = new Uint8Array(frame.payload)
-      const text = new util.TextDecoder().decodeToString(payloadBytes)
-      this.appendLog(`Data received: ${text}`)
-      const msg: ChatMessage = {
-        id: `${Date.now()}`,
-        text: text,
-        isSelf: false,
-        time: new Date().toLocaleTimeString(),
-      }
-      this.chatMessages = [...this.chatMessages, msg]
-      this.resetHeartbeatTimer()
-    }
-  }
+  // ── Chat ──────────────────────────────────────────────────────────
 
   private sendMessage(): void {
     if (!this.connected || this.inputText.length === 0) return
@@ -282,8 +199,7 @@ struct IdsPage {
     const text = this.inputText
     this.inputText = ''
 
-    const frame: ArrayBuffer = ppsdk.encodeDataFrame(text)
-    ppsdk.send(frame)
+    ppsdk.sendText(text)
 
     const msg: ChatMessage = {
       id: `${Date.now()}`,
@@ -347,15 +263,6 @@ struct IdsPage {
           .textAlign(TextAlign.Center)
           .backgroundColor(this.step >= 3 ? '#007DFF' : '#CCCCCC')
           .borderRadius(14)
-        Text('4')
-          .fontSize(14)
-          .fontWeight(FontWeight.Bold)
-          .fontColor('#FFFFFF')
-          .width(28)
-          .height(28)
-          .textAlign(TextAlign.Center)
-          .backgroundColor(this.step >= 4 ? '#007DFF' : '#CCCCCC')
-          .borderRadius(14)
       }
       .width('100%')
       .padding({ left: 16 })
@@ -386,7 +293,7 @@ struct IdsPage {
             .width('90%')
             .wordBreak(WordBreak.BREAK_ALL)
 
-          Button('Next: Gather Candidates >')
+          Button('Next: Query IDS >')
             .width('90%')
             .fontSize(16)
             .fontColor('#FFFFFF')
@@ -401,71 +308,10 @@ struct IdsPage {
         .alignItems(HorizontalAlign.Center)
       }
 
-      // Step 2: Gather candidates
+      // Step 2: Query IDS
       if (this.step === 2) {
         Column({ space: 12 }) {
-          Text('Step 2: Gather Candidates')
-            .fontSize(16)
-            .fontWeight(FontWeight.Bold)
-            .width('90%')
-
-          Button(this.isGathering ? 'Gathering...' : 'Gather Candidates')
-            .width('90%')
-            .fontSize(16)
-            .fontColor('#FFFFFF')
-            .backgroundColor('#007DFF')
-            .borderRadius(20)
-            .enabled(!this.isGathering)
-            .onClick(() => {
-              this.doGatherCandidates()
-            })
-
-          Text(this.gatheringStatus)
-            .fontSize(14)
-            .fontColor('#666666')
-            .width('90%')
-
-          if (this.candidates.length > 0) {
-            ForEach(this.candidates, (line: string) => {
-              Text(line)
-                .fontSize(12)
-                .fontColor('#333333')
-                .width('90%')
-                .wordBreak(WordBreak.BREAK_ALL)
-            }, (line: string, index: number) => `cand_${index}`)
-          }
-
-          if (this.candidates.length > 0) {
-            Button('Next: Query IDS >')
-              .width('90%')
-              .fontSize(16)
-              .fontColor('#FFFFFF')
-              .backgroundColor('#2E7D32')
-              .borderRadius(20)
-              .onClick(() => {
-                this.step = 3
-              })
-          }
-
-          Button('< Back')
-            .width('90%')
-            .fontSize(14)
-            .fontColor('#FFFFFF')
-            .backgroundColor('#999999')
-            .borderRadius(16)
-            .onClick(() => {
-              this.step = 1
-            })
-        }
-        .width('100%')
-        .padding({ left: 16, right: 16, top: 12 })
-        .alignItems(HorizontalAlign.Center)
-      }
-
-      // Step 3: Query IDS
-      if (this.step === 3) {
-        Column({ space: 12 }) {
-          Text('Step 3: Query IDS Service')
+          Text('Step 2: Query IDS Service')
             .fontSize(16)
             .fontWeight(FontWeight.Bold)
             .width('90%')
@@ -495,7 +341,7 @@ struct IdsPage {
               .backgroundColor('#2E7D32')
               .borderRadius(20)
               .onClick(() => {
-                this.step = 4
+                this.step = 3
               })
           }
 
@@ -506,7 +352,7 @@ struct IdsPage {
             .backgroundColor('#999999')
             .borderRadius(16)
             .onClick(() => {
-              this.step = 2
+              this.step = 1
             })
         }
         .width('100%')
@@ -514,8 +360,8 @@ struct IdsPage {
         .alignItems(HorizontalAlign.Center)
       }
 
-      // Step 4: P2P Connection
-      if (this.step === 4) {
+      // Step 3: P2P Connection
+      if (this.step === 3) {
         Column() {
           // Connection status
           Row({ space: 12 }) {
@@ -527,11 +373,6 @@ struct IdsPage {
                 this.disconnected ? '#E53935' :
                 '#333333'
               )
-            if (this.lastHeartbeat.length > 0) {
-              Text(`HB: ${this.lastHeartbeat}`)
-                .fontSize(12)
-                .fontColor('#999999')
-            }
           }
           .width('90%')
 
@@ -624,7 +465,7 @@ struct IdsPage {
             .backgroundColor('#999999')
             .borderRadius(16)
             .onClick(() => {
-              this.step = 3
+              this.step = 2
             })
         }
         .width('100%')

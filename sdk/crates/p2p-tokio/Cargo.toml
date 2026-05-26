@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 p2p-core = { path = "../p2p-core" }
 p2p-io = { path = "../p2p-io" }
-p2p-sdk = { path = "../p2p-sdk" }
 thiserror = { workspace = true }
 log = { workspace = true }
 rand = { workspace = true }

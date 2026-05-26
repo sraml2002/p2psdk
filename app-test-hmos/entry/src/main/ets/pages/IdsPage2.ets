@@ -26,11 +26,6 @@ interface IdsRecord {
   token: string
 }
 
-interface ParsedFrame {
-  type: number
-  payload: ArrayBuffer
-}
-
 interface ChatMessage {
   id: string
   text: string
@@ -38,21 +33,17 @@ interface ChatMessage {
   time: string
 }
 
-const HEARTBEAT_TIMEOUT_MS = 60000
-
 @Entry
 @Component
 struct IdsPage2 {
-  @State phase: string = 'idle' // idle | connecting | connected | failed
+  @State phase: string = 'idle' // idle | connecting | connected | failed | disconnected
   @State statusText: string = ''
   @State errorMsg: string = ''
   @State chatMessages: ChatMessage[] = []
   @State inputText: string = ''
   @State logs: string[] = []
-  @State lastHeartbeat: string = ''
   @State connectTimeMs: number = 0
 
-  private heartbeatTimerId: number = -1
   private connectStartTime: number = 0
   private config: AppConfig = { idsUrl: '', natUrl: '', appId: '', userId: '' }
 
@@ -66,28 +57,29 @@ struct IdsPage2 {
         }
         this.phase = 'connected'
         this.statusText = `P2P 连接已建立 (${this.connectTimeMs}ms)`
-        this.resetHeartbeatTimer()
       } else if (state === 'FAILED') {
         this.setError('ICE 连接失败')
+      } else if (state === 'DISCONNECTED') {
+        this.setError('连接断开')
       }
     })
     ppsdk.onLog((msg: string): void => {
       this.appendLog(msg)
     })
-    ppsdk.onDataReceived((data: ArrayBuffer): void => {
-      this.handleChatData(data)
+    ppsdk.onData((data: ArrayBuffer): void => {
+      const payloadBytes = new Uint8Array(data)
+      const text: string = new util.TextDecoder().decodeToString(payloadBytes)
+      const msg: ChatMessage = {
+        id: `${Date.now()}`,
+        text: text,
+        isSelf: false,
+        time: new Date().toLocaleTimeString(),
+      }
+      this.chatMessages = [...this.chatMessages, msg]
     })
   }
 
   aboutToDisappear(): void {
-    this.cleanup()
-  }
-
-  private cleanup(): void {
-    if (this.heartbeatTimerId !== -1) {
-      clearTimeout(this.heartbeatTimerId)
-      this.heartbeatTimerId = -1
-    }
     ppsdk.close()
   }
 
@@ -103,18 +95,6 @@ struct IdsPage2 {
     this.phase = 'failed'
     this.errorMsg = msg
     this.statusText = ''
-  }
-
-  private resetHeartbeatTimer(): void {
-    if (this.heartbeatTimerId !== -1) {
-      clearTimeout(this.heartbeatTimerId)
-    }
-    this.lastHeartbeat = new Date().toLocaleTimeString()
-    this.heartbeatTimerId = setTimeout(() => {
-      this.appendLog('Heartbeat timeout — connection lost')
-      this.setError('心跳超时，连接断开')
-      this.heartbeatTimerId = -1
-    }, HEARTBEAT_TIMEOUT_MS)
   }
 
   // ── One-click connect ─────────────────────────────────────────────
@@ -199,37 +179,13 @@ struct IdsPage2 {
 
   // ── Chat ──────────────────────────────────────────────────────────
 
-  private handleChatData(data: ArrayBuffer): void {
-    const frame: ParsedFrame = ppsdk.parseFrame(data)
-    if (frame.type === 0) {
-      return
-    }
-    if (frame.type === 1) {
-      this.resetHeartbeatTimer()
-      const reply: ArrayBuffer = ppsdk.encodeHeartbeatReply()
-      ppsdk.send(reply)
-    } else if (frame.type === 2) {
-      const payloadBytes = new Uint8Array(frame.payload)
-      const text: string = new util.TextDecoder().decodeToString(payloadBytes)
-      const msg: ChatMessage = {
-        id: `${Date.now()}`,
-        text: text,
-        isSelf: false,
-        time: new Date().toLocaleTimeString(),
-      }
-      this.chatMessages = [...this.chatMessages, msg]
-      this.resetHeartbeatTimer()
-    }
-  }
-
   private sendMessage(): void {
     if (this.phase !== 'connected' || this.inputText.length === 0) return
 
     const text: string = this.inputText
     this.inputText = ''
 
-    const frame: ArrayBuffer = ppsdk.encodeDataFrame(text)
-    ppsdk.send(frame)
+    ppsdk.sendText(text)
 
     const msg: ChatMessage = {
       id: `${Date.now()}`,
@@ -352,11 +308,6 @@ struct IdsPage2 {
           Text(`  建链耗时: ${this.connectTimeMs}ms`)
             .fontSize(12)
             .fontColor('#333333')
-          if (this.lastHeartbeat.length > 0) {
-            Text(`  HB: ${this.lastHeartbeat}`)
-              .fontSize(12)
-              .fontColor('#999999')
-          }
         }
         .width('90%')
         .padding({ top: 4, bottom: 4 })

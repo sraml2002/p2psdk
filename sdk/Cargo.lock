@@ -1205,11 +1205,14 @@ dependencies = [
 name = "p2p-sdk"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "log",
  "p2p-core",
  "p2p-io",
+ "p2p-tokio",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
 ]
 
@@ -1220,7 +1223,6 @@ dependencies = [
  "log",
  "p2p-core",
  "p2p-io",
- "p2p-sdk",
  "rand 0.8.6",
  "reqwest",
  "thiserror 2.0.18",
@@ -1327,7 +1329,6 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 name = "ppsdk"
 version = "0.1.0"
 dependencies = [
- "aes-gcm",
  "once_cell",
  "p2p-core",
  "p2p-io",
@@ -1335,7 +1336,6 @@ dependencies = [
  "p2p-tokio",
  "serde",
  "serde_json",
- "sha2",
 ]
 
 [[package]]

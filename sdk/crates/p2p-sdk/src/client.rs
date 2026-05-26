@@ -2,16 +2,22 @@
 //!
 //! Coordinates ICE, STUN, TURN, IDS, and Connector signaling.
 
-use p2p_core::frame::{encode_data_frame, parse_frame, ParsedFrame};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use p2p_core::frame::{encode_data_frame, encode_heartbeat_reply, parse_frame, ParsedFrame};
 use p2p_core::ice::agent::{HandleDataResult, IceAction, IceAgent, IceAgentConfig};
 use p2p_core::ice::check_list::calc_candidate_priority;
 use p2p_core::sdp::{generate_sdp_offer, parse_sdp_answer};
 use p2p_core::stun::client::{get_external_address, get_turn_relay_address};
 use p2p_core::types::{
-    ConnectorMessage, IceCandidate, IceCandidateMessage, IceDataMessage, CandidateType, IceState,
+    CandidateType, ConnectorMessage, IceCandidate, IceCandidateMessage, IceDataMessage, IceState,
     AF_INET,
 };
-use p2p_io::traits::{HttpTransport, Platform, SignalingTransport, UdpTransport};
+use p2p_io::traits::{HttpTransport, IoProvider, Platform, SignalingTransport, UdpTransport};
+use p2p_tokio::SyncIoProvider;
 
 use crate::config::Config;
 use crate::connector::ConnectorClient;
@@ -42,6 +48,62 @@ struct NatRoute {
 }
 
 // ---------------------------------------------------------------------------
+// ClientInner — shared mutable state for connect threads
+// ---------------------------------------------------------------------------
+
+struct ClientInner {
+    io: Option<Arc<dyn IoProvider>>,
+
+    // NAT / STUN / TURN cache
+    nat_route: Option<NatRoute>,
+    stun_external_ip: String,
+    stun_external_port: u16,
+    turn_relay_ip: String,
+    turn_relay_port: u16,
+    turn_mapped_ip: String,
+    turn_mapped_port: u16,
+
+    // ICE runtime
+    ice_agent: Option<IceAgent>,
+    ice_udp: Option<Arc<dyn UdpTransport>>,
+    tick_handle: Option<JoinHandle<()>>,
+    recv_handle: Option<JoinHandle<()>>,
+    ice_stop: Arc<AtomicBool>,
+
+    // Callbacks
+    on_state_change: Option<Box<dyn Fn(IceState) + Send>>,
+    on_data: Option<Box<dyn Fn(Vec<u8>) + Send>>,
+
+    // Heartbeat
+    heartbeat_interval_secs: u32,
+    last_recv_instant: Option<Instant>,
+}
+
+impl ClientInner {
+    fn new() -> Self {
+        Self {
+            io: None,
+            nat_route: None,
+            stun_external_ip: String::new(),
+            stun_external_port: 0,
+            turn_relay_ip: String::new(),
+            turn_relay_port: 0,
+            turn_mapped_ip: String::new(),
+            turn_mapped_port: 0,
+            ice_agent: None,
+            ice_udp: None,
+            tick_handle: None,
+            recv_handle: None,
+            ice_stop: Arc::new(AtomicBool::new(false)),
+            on_state_change: None,
+            on_data: None,
+            heartbeat_interval_secs: 0,
+            last_recv_instant: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // P2pClient
 // ---------------------------------------------------------------------------
 
@@ -50,18 +112,7 @@ struct NatRoute {
 /// Coordinates ICE, STUN, TURN, IDS, and Connector signaling.
 pub struct P2pClient {
     config: Option<Config>,
-    nat_route: Option<NatRoute>,
-
-    // Cached STUN/TURN results
-    stun_external_ip: String,
-    stun_external_port: u16,
-    turn_relay_ip: String,
-    turn_relay_port: u16,
-    turn_mapped_ip: String,
-    turn_mapped_port: u16,
-
-    // ICE
-    ice_agent: Option<IceAgent>,
+    inner: Arc<Mutex<ClientInner>>,
 
     // Connector signaling
     connector: Option<ConnectorClient>,
@@ -74,14 +125,7 @@ impl P2pClient {
     pub fn new() -> Self {
         Self {
             config: None,
-            nat_route: None,
-            stun_external_ip: String::new(),
-            stun_external_port: 0,
-            turn_relay_ip: String::new(),
-            turn_relay_port: 0,
-            turn_mapped_ip: String::new(),
-            turn_mapped_port: 0,
-            ice_agent: None,
+            inner: Arc::new(Mutex::new(ClientInner::new())),
             connector: None,
             identifier: String::new(),
         }
@@ -89,16 +133,27 @@ impl P2pClient {
 
     pub fn init(&mut self, config: Config) {
         self.config = Some(config);
+        self.inner.lock().unwrap().io = Some(Arc::new(SyncIoProvider));
     }
 
-    // ── NAT route resolution ────────────────────────────────────────────────
+    // ── Callback registration ─────────────────────────────────────────────
+
+    /// Register a callback for ICE state changes.
+    pub fn on_state_change(&self, cb: Box<dyn Fn(IceState) + Send>) {
+        self.inner.lock().unwrap().on_state_change = Some(cb);
+    }
+
+    /// Register a callback for received data (data-frame payload only;
+    /// heartbeat frames are handled internally and not reported).
+    pub fn on_data(&self, cb: Box<dyn Fn(Vec<u8>) + Send>) {
+        self.inner.lock().unwrap().on_data = Some(cb);
+    }
+
+    // ── NAT route resolution ──────────────────────────────────────────────
 
     /// Fetch NAT route info (STUN/TURN server addresses) from the route service.
-    ///
-    /// Failures are non-fatal: if STUN/TURN queries fail, empty values are stored
-    /// and ICE will proceed with host candidates only.
     pub fn resolve_nat_route(
-        &mut self,
+        &self,
         http: &dyn HttpTransport,
         p2p_token: &str,
     ) -> Result<(), String> {
@@ -114,9 +169,11 @@ impl P2pClient {
 
         let parse_port = |v: Option<&serde_json::Value>| -> u16 {
             v.and_then(|v| {
-                v.as_u64().map(|n| n as u16)
+                v.as_u64()
+                    .map(|n| n as u16)
                     .or_else(|| v.as_str().and_then(|s| s.parse::<u16>().ok()))
-            }).unwrap_or(0)
+            })
+            .unwrap_or(0)
         };
 
         let mut stun_ip = String::new();
@@ -124,14 +181,18 @@ impl P2pClient {
         let mut turn_ip = String::new();
         let mut turn_port: u16 = 0;
 
-        // STUN (type=2) — failure is non-fatal
         let stun_body = serde_json::json!({ "type": 2 });
         if let Ok(body_bytes) = serde_json::to_vec(&stun_body) {
             match http.post(url, &headers, &body_bytes) {
                 Ok((status, resp)) if (200..300).contains(&status) => {
-                    let json: serde_json::Value = serde_json::from_str(&resp).unwrap_or_default();
+                    let json: serde_json::Value =
+                        serde_json::from_str(&resp).unwrap_or_default();
                     let data = json.get("data").unwrap_or(&json);
-                    stun_ip = data.get("stunIp").and_then(|v| v.as_str()).unwrap_or("").into();
+                    stun_ip = data
+                        .get("stunIp")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .into();
                     stun_port = parse_port(data.get("stunPort"));
                 }
                 Ok((status, _)) => eprintln!("NAT STUN: HTTP {status}"),
@@ -139,14 +200,18 @@ impl P2pClient {
             }
         }
 
-        // TURN (type=3) — failure is non-fatal
         let turn_body = serde_json::json!({ "type": 3 });
         if let Ok(body_bytes) = serde_json::to_vec(&turn_body) {
             match http.post(url, &headers, &body_bytes) {
                 Ok((status, resp)) if (200..300).contains(&status) => {
-                    let json: serde_json::Value = serde_json::from_str(&resp).unwrap_or_default();
+                    let json: serde_json::Value =
+                        serde_json::from_str(&resp).unwrap_or_default();
                     let data = json.get("data").unwrap_or(&json);
-                    turn_ip = data.get("turnIp").and_then(|v| v.as_str()).unwrap_or("").into();
+                    turn_ip = data
+                        .get("turnIp")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .into();
                     turn_port = parse_port(data.get("turnPort"));
                 }
                 Ok((status, _)) => eprintln!("NAT TURN: HTTP {status}"),
@@ -154,90 +219,101 @@ impl P2pClient {
             }
         }
 
-        self.nat_route = Some(NatRoute { stun_ip, stun_port, turn_ip, turn_port });
+        self.inner.lock().unwrap().nat_route = Some(NatRoute {
+            stun_ip,
+            stun_port,
+            turn_ip,
+            turn_port,
+        });
         Ok(())
     }
 
-    // ── Candidate gathering ─────────────────────────────────────────────────
+    // ── Candidate gathering ───────────────────────────────────────────────
 
     /// Gather candidate information for display (no ICE agent created).
-    /// Caches STUN/TURN results for later use by `setup_ice_and_gather`.
     pub fn gather_candidate_info(
-        &mut self,
+        &self,
         udp: &dyn UdpTransport,
         platform: &dyn Platform,
         http: &dyn HttpTransport,
         p2p_token: &str,
     ) -> Result<CandidateInfo, String> {
-        // Resolve NAT route if not cached
-        if self.nat_route.is_none() {
-            self.resolve_nat_route(http, p2p_token)?;
+        {
+            let inner = self.inner.lock().unwrap();
+            if inner.nat_route.is_none() {
+                drop(inner);
+                self.resolve_nat_route(http, p2p_token)?;
+            }
         }
 
         let local_addrs = platform.get_local_addresses();
 
-        // STUN binding (srflx) — only if not cached
-        if self.stun_external_ip.is_empty() {
-            if let Some(route) = &self.nat_route {
-                let send = &mut |data: &[u8]| {
-                    let _ = udp.send_to(data, &route.stun_ip, route.stun_port);
-                };
-                let recv = &mut |timeout_ms: u64| -> Option<Vec<u8>> {
-                    udp.recv_from(timeout_ms).ok().map(|(data, _, _)| data)
-                };
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.stun_external_ip.is_empty() {
+                if let Some(route) = &inner.nat_route {
+                    let send = &mut |data: &[u8]| {
+                        let _ = udp.send_to(data, &route.stun_ip, route.stun_port);
+                    };
+                    let recv = &mut |timeout_ms: u64| -> Option<Vec<u8>> {
+                        udp.recv_from(timeout_ms).ok().map(|(data, _, _)| data)
+                    };
 
-                if let Ok(result) = get_external_address(
-                    send, recv, &route.stun_ip, route.stun_port, p2p_token,
-                ) {
-                    self.stun_external_ip = result.ip.clone();
-                    self.stun_external_port = result.port;
+                    if let Ok(result) =
+                        get_external_address(send, recv, &route.stun_ip, route.stun_port, p2p_token)
+                    {
+                        inner.stun_external_ip = result.ip.clone();
+                        inner.stun_external_port = result.port;
+                    }
+                }
+            }
+
+            if inner.turn_relay_ip.is_empty() {
+                if let Some(route) = &inner.nat_route {
+                    let send = &mut |data: &[u8]| {
+                        let _ = udp.send_to(data, &route.turn_ip, route.turn_port);
+                    };
+                    let recv = &mut |timeout_ms: u64| -> Option<Vec<u8>> {
+                        udp.recv_from(timeout_ms).ok().map(|(data, _, _)| data)
+                    };
+
+                    if let Ok(result) = get_turn_relay_address(
+                        send,
+                        recv,
+                        &route.turn_ip,
+                        route.turn_port,
+                        p2p_token,
+                        AF_INET,
+                    ) {
+                        inner.turn_relay_ip = result.relay_ip.clone();
+                        inner.turn_relay_port = result.relay_port;
+                        inner.turn_mapped_ip = result.mapped_ip.clone();
+                        inner.turn_mapped_port = result.mapped_port;
+                    }
                 }
             }
         }
 
-        // TURN allocate (relay) — only if not cached
-        if self.turn_relay_ip.is_empty() {
-            if let Some(route) = &self.nat_route {
-                let send = &mut |data: &[u8]| {
-                    let _ = udp.send_to(data, &route.turn_ip, route.turn_port);
-                };
-                let recv = &mut |timeout_ms: u64| -> Option<Vec<u8>> {
-                    udp.recv_from(timeout_ms).ok().map(|(data, _, _)| data)
-                };
-
-                if let Ok(result) = get_turn_relay_address(
-                    send, recv,
-                    &route.turn_ip, route.turn_port,
-                    p2p_token, AF_INET,
-                ) {
-                    self.turn_relay_ip = result.relay_ip.clone();
-                    self.turn_relay_port = result.relay_port;
-                    self.turn_mapped_ip = result.mapped_ip.clone();
-                    self.turn_mapped_port = result.mapped_port;
-                }
-            }
-        }
-
-        // Build display lines
+        let inner = self.inner.lock().unwrap();
         let mut lines = Vec::new();
         for addr in &local_addrs {
             if *addr != "127.0.0.1" && *addr != "::1" {
                 lines.push(format!("host    {addr}"));
             }
         }
-        if !self.stun_external_ip.is_empty() {
-            if let Some(route) = &self.nat_route {
+        if !inner.stun_external_ip.is_empty() {
+            if let Some(route) = &inner.nat_route {
                 lines.push(format!(
                     "srflx   {}:{} (via {})",
-                    self.stun_external_ip, self.stun_external_port, route.stun_ip
+                    inner.stun_external_ip, inner.stun_external_port, route.stun_ip
                 ));
             }
         }
-        if !self.turn_relay_ip.is_empty() {
-            if let Some(route) = &self.nat_route {
+        if !inner.turn_relay_ip.is_empty() {
+            if let Some(route) = &inner.nat_route {
                 lines.push(format!(
                     "relay   {}:{} (via {})",
-                    self.turn_relay_ip, self.turn_relay_port, route.turn_ip
+                    inner.turn_relay_ip, inner.turn_relay_port, route.turn_ip
                 ));
             }
         }
@@ -248,17 +324,16 @@ impl P2pClient {
         Ok(CandidateInfo {
             candidate_lines: lines,
             local_addresses: local_addrs,
-            stun_external_ip: self.stun_external_ip.clone(),
-            stun_external_port: self.stun_external_port,
-            turn_relay_ip: self.turn_relay_ip.clone(),
-            turn_relay_port: self.turn_relay_port,
+            stun_external_ip: inner.stun_external_ip.clone(),
+            stun_external_port: inner.stun_external_port,
+            turn_relay_ip: inner.turn_relay_ip.clone(),
+            turn_relay_port: inner.turn_relay_port,
         })
     }
 
-    /// Create ICE agent and gather all candidates.
-    /// Uses cached STUN/TURN results if available, queries fresh otherwise.
+    /// Create ICE agent and gather all candidates (uses cached STUN/TURN).
     pub fn setup_ice_and_gather(
-        &mut self,
+        &self,
         udp: &dyn UdpTransport,
         platform: &dyn Platform,
         p2p_token: &str,
@@ -269,42 +344,38 @@ impl P2pClient {
 
         let mut agent = IceAgent::new(IceAgentConfig { is_controlling });
 
-        // Add host candidates
         for addr in &local_addrs {
             agent.add_host_candidate(addr, local_port);
         }
 
-        // STUN external address (srflx) — use cached or query fresh
-        if self.nat_route.is_some() {
-            if !self.stun_external_ip.is_empty() {
-                // Use cached result
+        let mut inner = self.inner.lock().unwrap();
+
+        if inner.nat_route.is_some() {
+            if !inner.stun_external_ip.is_empty() {
                 agent.add_local_candidate(IceCandidate {
                     foundation: "srflx1".into(),
                     component_id: 1,
                     transport: "UDP".into(),
                     priority: calc_candidate_priority(CandidateType::Srflx),
-                    connection_address: self.stun_external_ip.clone(),
-                    port: self.stun_external_port,
+                    connection_address: inner.stun_external_ip.clone(),
+                    port: inner.stun_external_port,
                     candidate_type: CandidateType::Srflx,
                     related_address: local_addrs.first().cloned().unwrap_or_default(),
                     related_port: local_port,
                 });
             } else {
-                // Query fresh
-                let route = self.nat_route.as_ref().unwrap();
-
+                let route = inner.nat_route.as_ref().unwrap();
                 let send = &mut |data: &[u8]| {
                     let _ = udp.send_to(data, &route.stun_ip, route.stun_port);
                 };
                 let recv = &mut |timeout_ms: u64| -> Option<Vec<u8>> {
                     udp.recv_from(timeout_ms).ok().map(|(data, _, _)| data)
                 };
-
-                if let Ok(result) = get_external_address(
-                    send, recv, &route.stun_ip, route.stun_port, p2p_token,
-                ) {
-                    self.stun_external_ip = result.ip.clone();
-                    self.stun_external_port = result.port;
+                if let Ok(result) =
+                    get_external_address(send, recv, &route.stun_ip, route.stun_port, p2p_token)
+                {
+                    inner.stun_external_ip = result.ip.clone();
+                    inner.stun_external_port = result.port;
                     agent.add_local_candidate(IceCandidate {
                         foundation: "srflx1".into(),
                         component_id: 1,
@@ -319,38 +390,38 @@ impl P2pClient {
                 }
             }
 
-            // TURN relay candidate — use cached or query fresh
-            if !self.turn_relay_ip.is_empty() {
+            if !inner.turn_relay_ip.is_empty() {
                 agent.add_local_candidate(IceCandidate {
                     foundation: "relay1".into(),
                     component_id: 1,
                     transport: "UDP".into(),
                     priority: calc_candidate_priority(CandidateType::Relay),
-                    connection_address: self.turn_relay_ip.clone(),
-                    port: self.turn_relay_port,
+                    connection_address: inner.turn_relay_ip.clone(),
+                    port: inner.turn_relay_port,
                     candidate_type: CandidateType::Relay,
-                    related_address: self.stun_external_ip.clone(),
-                    related_port: self.stun_external_port,
+                    related_address: inner.stun_external_ip.clone(),
+                    related_port: inner.stun_external_port,
                 });
             } else {
-                let route = self.nat_route.as_ref().unwrap();
-
+                let route = inner.nat_route.as_ref().unwrap();
                 let send = &mut |data: &[u8]| {
                     let _ = udp.send_to(data, &route.turn_ip, route.turn_port);
                 };
                 let recv = &mut |timeout_ms: u64| -> Option<Vec<u8>> {
                     udp.recv_from(timeout_ms).ok().map(|(data, _, _)| data)
                 };
-
                 if let Ok(turn_result) = get_turn_relay_address(
-                    send, recv,
-                    &route.turn_ip, route.turn_port,
-                    p2p_token, AF_INET,
+                    send,
+                    recv,
+                    &route.turn_ip,
+                    route.turn_port,
+                    p2p_token,
+                    AF_INET,
                 ) {
-                    self.turn_relay_ip = turn_result.relay_ip.clone();
-                    self.turn_relay_port = turn_result.relay_port;
-                    self.turn_mapped_ip = turn_result.mapped_ip.clone();
-                    self.turn_mapped_port = turn_result.mapped_port;
+                    inner.turn_relay_ip = turn_result.relay_ip.clone();
+                    inner.turn_relay_port = turn_result.relay_port;
+                    inner.turn_mapped_ip = turn_result.mapped_ip.clone();
+                    inner.turn_mapped_port = turn_result.mapped_port;
                     agent.add_local_candidate(IceCandidate {
                         foundation: "relay1".into(),
                         component_id: 1,
@@ -359,21 +430,20 @@ impl P2pClient {
                         connection_address: turn_result.relay_ip,
                         port: turn_result.relay_port,
                         candidate_type: CandidateType::Relay,
-                        related_address: self.stun_external_ip.clone(),
-                        related_port: self.stun_external_port,
+                        related_address: inner.stun_external_ip.clone(),
+                        related_port: inner.stun_external_port,
                     });
                 }
             }
         }
 
-        self.ice_agent = Some(agent);
+        inner.ice_agent = Some(agent);
         Ok(())
     }
 
-    /// Gather ICE candidates: STUN external address, TURN relay, and local addresses.
-    /// This creates an ICE agent. For display-only, use `gather_candidate_info` instead.
+    /// Gather ICE candidates and create ICE agent (legacy, no caching).
     pub fn gather_candidates(
-        &mut self,
+        &self,
         udp: &dyn UdpTransport,
         platform: &dyn Platform,
         p2p_token: &str,
@@ -384,13 +454,17 @@ impl P2pClient {
 
         let mut agent = IceAgent::new(IceAgentConfig { is_controlling });
 
-        // Add host candidates
         for addr in &local_addrs {
             agent.add_host_candidate(addr, local_port);
         }
 
-        // STUN external address (srflx candidate)
-        if let Some(route) = &self.nat_route {
+        let inner = self.inner.lock().unwrap();
+
+        // Clone route fields to avoid borrow conflict
+        let route_clone = inner.nat_route.clone();
+        drop(inner);
+
+        if let Some(route) = &route_clone {
             let send = &mut |data: &[u8]| {
                 let _ = udp.send_to(data, &route.stun_ip, route.stun_port);
             };
@@ -398,14 +472,17 @@ impl P2pClient {
                 udp.recv_from(timeout_ms).ok().map(|(data, _, _)| data)
             };
 
-            if let Ok(result) = get_external_address(send, recv, &route.stun_ip, route.stun_port, p2p_token) {
-                self.stun_external_ip = result.ip.clone();
-                self.stun_external_port = result.port;
-                agent.add_local_candidate(p2p_core::types::IceCandidate {
+            if let Ok(result) =
+                get_external_address(send, recv, &route.stun_ip, route.stun_port, p2p_token)
+            {
+                let mut inner = self.inner.lock().unwrap();
+                inner.stun_external_ip = result.ip.clone();
+                inner.stun_external_port = result.port;
+                agent.add_local_candidate(IceCandidate {
                     foundation: "srflx1".into(),
                     component_id: 1,
                     transport: "UDP".into(),
-                    priority: p2p_core::ice::check_list::calc_candidate_priority(CandidateType::Srflx),
+                    priority: calc_candidate_priority(CandidateType::Srflx),
                     connection_address: result.ip,
                     port: result.port,
                     candidate_type: CandidateType::Srflx,
@@ -414,46 +491,99 @@ impl P2pClient {
                 });
             }
 
-            // TURN relay candidate
             if let Ok(turn_result) = get_turn_relay_address(
-                send, recv,
-                &route.turn_ip, route.turn_port,
-                p2p_token, p2p_core::types::AF_INET,
+                send,
+                recv,
+                &route.turn_ip,
+                route.turn_port,
+                p2p_token,
+                AF_INET,
             ) {
-                self.turn_relay_ip = turn_result.relay_ip.clone();
-                self.turn_relay_port = turn_result.relay_port;
-                self.turn_mapped_ip = turn_result.mapped_ip.clone();
-                self.turn_mapped_port = turn_result.mapped_port;
-                agent.add_local_candidate(p2p_core::types::IceCandidate {
+                let mut inner = self.inner.lock().unwrap();
+                inner.turn_relay_ip = turn_result.relay_ip.clone();
+                inner.turn_relay_port = turn_result.relay_port;
+                inner.turn_mapped_ip = turn_result.mapped_ip.clone();
+                inner.turn_mapped_port = turn_result.mapped_port;
+                agent.add_local_candidate(IceCandidate {
                     foundation: "relay1".into(),
                     component_id: 1,
                     transport: "UDP".into(),
-                    priority: p2p_core::ice::check_list::calc_candidate_priority(CandidateType::Relay),
+                    priority: calc_candidate_priority(CandidateType::Relay),
                     connection_address: turn_result.relay_ip,
                     port: turn_result.relay_port,
                     candidate_type: CandidateType::Relay,
-                    related_address: self.stun_external_ip.clone(),
-                    related_port: self.stun_external_port,
+                    related_address: inner.stun_external_ip.clone(),
+                    related_port: inner.stun_external_port,
                 });
             }
         }
 
         let desc = agent.local_session_description();
-        self.ice_agent = Some(agent);
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.ice_agent = Some(agent);
+        }
 
+        let inner = self.inner.lock().unwrap();
         Ok(CandidateInfo {
             candidate_lines: desc.candidates,
             local_addresses: local_addrs,
-            stun_external_ip: self.stun_external_ip.clone(),
-            stun_external_port: self.stun_external_port,
-            turn_relay_ip: self.turn_relay_ip.clone(),
-            turn_relay_port: self.turn_relay_port,
+            stun_external_ip: inner.stun_external_ip.clone(),
+            stun_external_port: inner.stun_external_port,
+            turn_relay_ip: inner.turn_relay_ip.clone(),
+            turn_relay_port: inner.turn_relay_port,
         })
     }
 
-    // ── Connector signaling ─────────────────────────────────────────────────
+    // ── High-level connect ────────────────────────────────────────────────
 
-    /// Connect to the Connector signaling server and register.
+    /// One-stop P2P connection: NAT route → gather candidates → SDP negotiate
+    /// → start ICE tick/recv threads with heartbeat.
+    ///
+    /// Spawns a background thread. Results are delivered via `on_state_change`
+    /// and `on_data` callbacks. Requires `init` to have been called.
+    pub fn connect(
+        &self,
+        peer_addr: &str,
+        odid: &str,
+        heartbeat_interval_secs: u32,
+    ) -> Result<(), String> {
+        let config = self.config.as_ref().ok_or("not initialized")?;
+        let io = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .io
+                .clone()
+                .ok_or("not initialized — call init first")?
+        };
+
+        let p2p_token = crate::token::generate_token();
+        if p2p_token.is_empty() {
+            return Err("failed to generate P2P token".into());
+        }
+
+        // Store heartbeat interval
+        self.inner.lock().unwrap().heartbeat_interval_secs = heartbeat_interval_secs;
+
+        let inner = self.inner.clone();
+        let nat_url = config.nat_url.clone();
+        let p2p_token = p2p_token;
+        let peer_addr = peer_addr.to_string();
+        let odid = odid.to_string();
+
+        thread::spawn(move || {
+            if let Err(e) = connect_background(&inner, &io, &nat_url, &p2p_token, &peer_addr, &odid)
+            {
+                eprintln!("connect failed: {e}");
+                fire_state_change(&inner, IceState::Failed);
+            }
+        });
+
+        Ok(())
+    }
+
+    // ── Connector signaling ───────────────────────────────────────────────
+
     pub fn connect_connector(
         &mut self,
         ws: Box<dyn SignalingTransport>,
@@ -462,13 +592,14 @@ impl P2pClient {
         auth_token: &str,
     ) -> Result<(), String> {
         let mut connector = ConnectorClient::new(ws);
-        connector.connect(url, identifier, auth_token).map_err(|e| e.to_string())?;
+        connector
+            .connect(url, identifier, auth_token)
+            .map_err(|e| e.to_string())?;
         self.connector = Some(connector);
         self.identifier = identifier.into();
         Ok(())
     }
 
-    /// Poll the Connector for incoming messages.
     pub fn poll_connector(&mut self) -> Vec<ConnectorMessage> {
         if let Some(connector) = &mut self.connector {
             connector.poll()
@@ -477,7 +608,6 @@ impl P2pClient {
         }
     }
 
-    /// Send a message to a peer via the Connector.
     pub fn send_connector_message(
         &self,
         target_id: &str,
@@ -490,11 +620,11 @@ impl P2pClient {
             .map_err(|e| e.to_string())
     }
 
-    // ── ICE signaling via Connector ─────────────────────────────────────────
+    // ── ICE signaling via Connector ───────────────────────────────────────
 
-    /// Initiate ICE by sending an offer via Connector signaling.
-    pub fn initiate_ice(&mut self, peer_id: &str) -> Result<(), String> {
-        let agent = self.ice_agent.as_ref().ok_or("no ICE agent")?;
+    pub fn initiate_ice(&self, peer_id: &str) -> Result<(), String> {
+        let inner = self.inner.lock().unwrap();
+        let agent = inner.ice_agent.as_ref().ok_or("no ICE agent")?;
         let desc = agent.local_session_description();
         let msg = IceDataMessage {
             action: "iceOffer".into(),
@@ -504,12 +634,12 @@ impl P2pClient {
             candidates: desc.candidates,
         };
         let data = serde_json::to_value(&msg).map_err(|e| e.to_string())?;
+        drop(inner);
         self.send_connector_message(peer_id, &data)
     }
 
-    /// Handle a signaling message (offer / answer / candidate).
     pub fn handle_signaling_message(
-        &mut self,
+        &self,
         msg: &ConnectorMessage,
     ) -> Result<Vec<IceAction>, String> {
         let data = &msg.data;
@@ -525,7 +655,8 @@ impl P2pClient {
                     is_lite: ice_msg.is_lite,
                     candidates: ice_msg.candidates,
                 };
-                let agent = self.ice_agent.as_mut().ok_or("no ICE agent")?;
+                let mut inner = self.inner.lock().unwrap();
+                let agent = inner.ice_agent.as_mut().ok_or("no ICE agent")?;
                 agent.set_remote_session_description(&desc);
                 if action == "iceOffer" {
                     agent.start_checks()?;
@@ -535,7 +666,8 @@ impl P2pClient {
             "iceCandidate" => {
                 let cand_msg: IceCandidateMessage =
                     serde_json::from_value(data.clone()).map_err(|e| e.to_string())?;
-                let agent = self.ice_agent.as_mut().ok_or("no ICE agent")?;
+                let mut inner = self.inner.lock().unwrap();
+                let agent = inner.ice_agent.as_mut().ok_or("no ICE agent")?;
                 agent.add_remote_candidate(&cand_msg.candidate);
                 Ok(Vec::new())
             }
@@ -543,21 +675,18 @@ impl P2pClient {
         }
     }
 
-    // ── SDP-based connection ────────────────────────────────────────────────
+    // ── SDP-based connection (low-level) ──────────────────────────────────
 
-    /// Connect via SDP offer/answer over HTTP.
-    ///
-    /// `peer_addr` is the signaling URL from IDS (e.g. "81.71.29.250:34848").
-    /// Posts raw SDP to `http://{peer_addr}/api/ice/offer`.
     pub fn connect_via_sdp(
-        &mut self,
+        &self,
         http: &dyn HttpTransport,
         odid: &str,
         peer_addr: &str,
         default_ip: &str,
         default_port: u16,
     ) -> Result<(), String> {
-        let agent = self.ice_agent.as_mut().ok_or("no ICE agent")?;
+        let mut inner = self.inner.lock().unwrap();
+        let agent = inner.ice_agent.as_mut().ok_or("no ICE agent")?;
         let desc = agent.local_session_description();
         let sdp_offer = generate_sdp_offer(
             odid,
@@ -583,33 +712,50 @@ impl P2pClient {
         Ok(())
     }
 
-    // ── ICE data flow ──────────────────────────────────────────────────────
+    // ── ICE data flow (low-level) ─────────────────────────────────────────
 
     /// Drive the ICE check cycle. Call periodically (~50 ms).
-    pub fn tick(&mut self, now_ms: u64) -> Vec<IceAction> {
-        self.ice_agent.as_mut().map(|a| a.tick(now_ms)).unwrap_or_default()
+    pub fn tick(&self, now_ms: u64) -> Vec<IceAction> {
+        self.inner
+            .lock()
+            .unwrap()
+            .ice_agent
+            .as_mut()
+            .map(|a| a.tick(now_ms))
+            .unwrap_or_default()
     }
 
     /// Process incoming UDP data through the ICE agent.
     pub fn handle_incoming_udp(
-        &mut self,
+        &self,
         data: &[u8],
         from_ip: &str,
         from_port: u16,
     ) -> HandleDataResult {
-        self.ice_agent
+        self.inner
+            .lock()
+            .unwrap()
+            .ice_agent
             .as_mut()
             .map(|a| a.handle_incoming_data(data, from_ip, from_port))
-            .unwrap_or(HandleDataResult { app_data: None, actions: Vec::new() })
+            .unwrap_or(HandleDataResult {
+                app_data: None,
+                actions: Vec::new(),
+            })
     }
 
-    /// Send application data through the ICE nominated pair.
-    pub fn send_data(&self, data: &[u8]) -> Option<IceAction> {
-        self.ice_agent.as_ref().and_then(|a| a.send_data(data))
+    /// Send application data through the ICE nominated pair (auto-send).
+    pub fn send_data(&self, data: &[u8]) -> Result<(), String> {
+        let inner = self.inner.lock().unwrap();
+        let agent = inner.ice_agent.as_ref().ok_or("no ICE agent")?;
+        let udp = inner.ice_udp.as_ref().ok_or("no UDP socket")?;
+        let act = agent.send_data(data).ok_or("no nominated pair")?;
+        udp.send_to(&act.data, &act.target_ip, act.target_port)
+            .map_err(|e| e.to_string())
     }
 
-    /// Send a text message as a P2P data frame.
-    pub fn send_text(&self, text: &str) -> Option<IceAction> {
+    /// Send a text message as a P2P data frame (auto-send).
+    pub fn send_text(&self, text: &str) -> Result<(), String> {
         let frame = encode_data_frame(text);
         self.send_data(&frame)
     }
@@ -619,43 +765,67 @@ impl P2pClient {
         parse_frame(data)
     }
 
-    // ── ICE state ───────────────────────────────────────────────────────────
+    // ── ICE state ─────────────────────────────────────────────────────────
 
     pub fn ice_state(&self) -> Option<IceState> {
-        self.ice_agent.as_ref().map(|a| a.state())
+        self.inner
+            .lock()
+            .unwrap()
+            .ice_agent
+            .as_ref()
+            .map(|a| a.state())
     }
 
     pub fn is_ice_completed(&self) -> bool {
         self.ice_state() == Some(IceState::Completed)
     }
 
-    // ── IDS operations ──────────────────────────────────────────────────────
+    // ── IDS operations ────────────────────────────────────────────────────
 
-    /// Register this device with the IDS service.
-    ///
-    /// Matches ArkTS: `registerIds(userId, odid, pushToken)` with type fixed to "app".
     pub fn register_ids(
         &self,
         http: &dyn HttpTransport,
+        app_id: &str,
         user_id: &str,
         odid: &str,
         push_token: &str,
     ) -> Result<(), String> {
         let config = self.config.as_ref().ok_or("not initialized")?;
-        ids::register_ids(http, &config.ids_url, &config.app_id, user_id, "app", odid, push_token)
+        ids::register_ids(
+            http,
+            &config.ids_url,
+            app_id,
+            user_id,
+            "app",
+            odid,
+            push_token,
+        )
     }
 
-    /// Query the IDS service for a user's records.
     pub fn query_ids(
         &self,
         http: &dyn HttpTransport,
+        app_id: &str,
         user_id: &str,
     ) -> Result<ids::IdsRecord, String> {
         let config = self.config.as_ref().ok_or("not initialized")?;
-        ids::query_ids(http, &config.ids_url, &config.app_id, user_id)
+        ids::query_ids(http, &config.ids_url, app_id, user_id)
     }
 
-    // ── Teardown ────────────────────────────────────────────────────────────
+    // ── Teardown ──────────────────────────────────────────────────────────
+
+    /// Stop ICE threads, close UDP, release all resources.
+    pub fn close(&self) -> Result<(), String> {
+        stop_ice_threads(&self.inner);
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(agent) = &mut inner.ice_agent {
+            agent.stop();
+        }
+        inner.ice_agent = None;
+        inner.ice_udp = None;
+        inner.heartbeat_interval_secs = 0;
+        Ok(())
+    }
 
     pub fn disconnect_connector(&mut self) {
         if let Some(connector) = &mut self.connector {
@@ -663,8 +833,10 @@ impl P2pClient {
         }
     }
 
-    pub fn stop_ice(&mut self) {
-        if let Some(agent) = &mut self.ice_agent {
+    pub fn stop_ice(&self) {
+        stop_ice_threads(&self.inner);
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(agent) = &mut inner.ice_agent {
             agent.stop();
         }
     }
@@ -673,6 +845,390 @@ impl P2pClient {
 impl Default for P2pClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal: background connect
+// ---------------------------------------------------------------------------
+
+fn connect_background(
+    inner: &Arc<Mutex<ClientInner>>,
+    io: &Arc<dyn IoProvider>,
+    nat_url: &str,
+    p2p_token: &str,
+    peer_addr: &str,
+    odid: &str,
+) -> Result<(), String> {
+    // Step 1: Resolve NAT route
+    let http = io.create_http();
+    if !nat_url.is_empty() {
+        let headers = vec![
+            ("Content-Type".into(), "application/json".into()),
+            ("Authorization".into(), p2p_token.into()),
+        ];
+        let parse_port = |v: Option<&serde_json::Value>| -> u16 {
+            v.and_then(|v| {
+                v.as_u64()
+                    .map(|n| n as u16)
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<u16>().ok()))
+            })
+            .unwrap_or(0)
+        };
+        let mut stun_ip = String::new();
+        let mut stun_port: u16 = 0;
+        let mut turn_ip = String::new();
+        let mut turn_port: u16 = 0;
+
+        let body = serde_json::json!({ "type": 2 });
+        if let Ok(b) = serde_json::to_vec(&body) {
+            if let Ok((s, r)) = http.post(nat_url, &headers, &b) {
+                if (200..300).contains(&s) {
+                    let j: serde_json::Value = serde_json::from_str(&r).unwrap_or_default();
+                    let d = j.get("data").unwrap_or(&j);
+                    stun_ip = d.get("stunIp").and_then(|v| v.as_str()).unwrap_or("").into();
+                    stun_port = parse_port(d.get("stunPort"));
+                }
+            }
+        }
+        let body = serde_json::json!({ "type": 3 });
+        if let Ok(b) = serde_json::to_vec(&body) {
+            if let Ok((s, r)) = http.post(nat_url, &headers, &b) {
+                if (200..300).contains(&s) {
+                    let j: serde_json::Value = serde_json::from_str(&r).unwrap_or_default();
+                    let d = j.get("data").unwrap_or(&j);
+                    turn_ip = d.get("turnIp").and_then(|v| v.as_str()).unwrap_or("").into();
+                    turn_port = parse_port(d.get("turnPort"));
+                }
+            }
+        }
+        inner.lock().unwrap().nat_route = Some(NatRoute {
+            stun_ip,
+            stun_port,
+            turn_ip,
+            turn_port,
+        });
+    }
+
+    // Step 2: Local addresses + UDP sockets for STUN/TURN queries
+    let local_addrs = io.get_local_addresses();
+    let local_addrs_v4: Vec<String> = local_addrs
+        .iter()
+        .filter(|a| !a.contains(':') && *a != "127.0.0.1")
+        .cloned()
+        .collect();
+
+    let route = inner.lock().unwrap().nat_route.clone();
+    let udp_v4 = io.create_udp(0).ok();
+
+    // Step 3: STUN binding
+    if let (Some(ref udp), Some(ref route)) = (&udp_v4, &route) {
+        if !route.stun_ip.is_empty() && route.stun_port > 0 {
+            let sip = route.stun_ip.clone();
+            let sport = route.stun_port;
+            let send = &mut |data: &[u8]| {
+                let _ = udp.send_to(data, &sip, sport);
+            };
+            let recv = &mut |t: u64| -> Option<Vec<u8>> { udp.recv_from(t).ok().map(|(d, _, _)| d) };
+            if let Ok(result) = get_external_address(send, recv, &sip, sport, p2p_token) {
+                inner.lock().unwrap().stun_external_ip = result.ip.clone();
+                inner.lock().unwrap().stun_external_port = result.port;
+            }
+        }
+    }
+
+    // Step 4: TURN allocate
+    if let (Some(ref udp), Some(ref route)) = (&udp_v4, &route) {
+        if !route.turn_ip.is_empty() && route.turn_port > 0 {
+            let tip = route.turn_ip.clone();
+            let tport = route.turn_port;
+            let send = &mut |data: &[u8]| {
+                let _ = udp.send_to(data, &tip, tport);
+            };
+            let recv = &mut |t: u64| -> Option<Vec<u8>> { udp.recv_from(t).ok().map(|(d, _, _)| d) };
+            if let Ok(result) = get_turn_relay_address(send, recv, &tip, tport, p2p_token, AF_INET)
+            {
+                let mut inner = inner.lock().unwrap();
+                inner.turn_relay_ip = result.relay_ip.clone();
+                inner.turn_relay_port = result.relay_port;
+            }
+        }
+    }
+
+    // Step 5: Create ICE agent + dedicated UDP socket
+    let ice_udp: Arc<dyn UdpTransport> = Arc::from(
+        io.create_udp(0)
+            .map_err(|e| format!("ICE UDP bind: {e}"))?,
+    );
+    let (_, ice_port) = ice_udp
+        .local_addr()
+        .map_err(|e| format!("local_addr: {e}"))?;
+
+    let mut agent = IceAgent::new(IceAgentConfig {
+        is_controlling: true,
+    });
+    for addr in &local_addrs_v4 {
+        agent.add_host_candidate(addr, ice_port);
+    }
+    {
+        let guard = inner.lock().unwrap();
+        if !guard.stun_external_ip.is_empty() {
+            agent.add_local_candidate(IceCandidate {
+                foundation: "srflx1".into(),
+                component_id: 1,
+                transport: "UDP".into(),
+                priority: calc_candidate_priority(CandidateType::Srflx),
+                connection_address: guard.stun_external_ip.clone(),
+                port: guard.stun_external_port,
+                candidate_type: CandidateType::Srflx,
+                related_address: local_addrs_v4.first().cloned().unwrap_or_default(),
+                related_port: ice_port,
+            });
+        }
+        if !guard.turn_relay_ip.is_empty() {
+            agent.add_local_candidate(IceCandidate {
+                foundation: "relay1".into(),
+                component_id: 1,
+                transport: "UDP".into(),
+                priority: calc_candidate_priority(CandidateType::Relay),
+                connection_address: guard.turn_relay_ip.clone(),
+                port: guard.turn_relay_port,
+                candidate_type: CandidateType::Relay,
+                related_address: guard.stun_external_ip.clone(),
+                related_port: guard.stun_external_port,
+            });
+        }
+    }
+
+    // Step 6: SDP offer/answer
+    let desc = agent.local_session_description();
+    let mut default_ip = String::new();
+    for line in &desc.candidates {
+        if line.contains("host") && !line.contains("::") {
+            let parts: Vec<&str> = line.split(' ').collect();
+            if parts.len() >= 5 {
+                default_ip = parts[4].into();
+                break;
+            }
+        }
+    }
+    let sdp_offer = generate_sdp_offer(odid, &desc.ice_ufrag, &desc.ice_pwd, &desc.candidates, &default_ip, ice_port);
+    let url = format!("http://{peer_addr}/api/ice/offer");
+    let (_, resp) = http
+        .post(
+            &url,
+            &[("Content-Type".into(), "application/sdp".into())],
+            sdp_offer.as_bytes(),
+        )
+        .map_err(|e| format!("SDP HTTP: {e}"))?;
+
+    let answer = parse_sdp_answer(resp.trim());
+    agent.set_remote_session_description(&p2p_core::types::IceSessionDescription {
+        ice_ufrag: answer.ufrag,
+        ice_pwd: answer.pwd,
+        is_lite: answer.is_lite,
+        candidates: answer.candidates,
+    });
+    agent
+        .start_checks()
+        .map_err(|e| format!("start_checks: {e}"))?;
+
+    // Step 7: Store agent + UDP, start threads
+    {
+        let mut inner = inner.lock().unwrap();
+        inner.ice_agent = Some(agent);
+        inner.ice_udp = Some(ice_udp);
+    }
+    start_ice_threads(inner);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Internal: ICE thread management
+// ---------------------------------------------------------------------------
+
+fn stop_ice_threads(inner: &Arc<Mutex<ClientInner>>) {
+    let (tick, recv) = {
+        let mut guard = inner.lock().unwrap();
+        guard.ice_stop.store(true, Ordering::Release);
+        (guard.tick_handle.take(), guard.recv_handle.take())
+    };
+    if let Some(h) = tick {
+        let _ = h.join();
+    }
+    if let Some(h) = recv {
+        let _ = h.join();
+    }
+}
+
+fn start_ice_threads(inner: &Arc<Mutex<ClientInner>>) {
+    stop_ice_threads(inner);
+    let stop = {
+        let mut guard = inner.lock().unwrap();
+        guard.ice_stop = Arc::new(AtomicBool::new(false));
+        Arc::clone(&guard.ice_stop)
+    };
+
+    let inner_tick = inner.clone();
+    let inner_recv = inner.clone();
+    let stop_tick = stop.clone();
+    let stop_recv = stop;
+
+    let tick_handle = thread::spawn(move || {
+        let mut now_ms: u64 = 0;
+        let mut last_state: Option<IceState> = None;
+        let mut last_heartbeat_ms: u64 = 0;
+
+        while !stop_tick.load(Ordering::Relaxed) {
+            now_ms += 50;
+
+            // ICE tick
+            let actions = {
+                let mut guard = inner_tick.lock().unwrap();
+                match &mut guard.ice_agent {
+                    Some(agent) => {
+                        let state = agent.state();
+                        if last_state != Some(state) {
+                            last_state = Some(state);
+                            drop(guard);
+                            fire_state_change(&inner_tick, state);
+                            // Re-acquire for tick
+                            let mut guard = inner_tick.lock().unwrap();
+                            guard
+                                .ice_agent
+                                .as_mut()
+                                .map(|a| a.tick(now_ms))
+                                .unwrap_or_default()
+                        } else {
+                            agent.tick(now_ms)
+                        }
+                    }
+                    None => Vec::new(),
+                }
+            };
+
+            // Send STUN actions
+            let udp = { inner_tick.lock().unwrap().ice_udp.clone() };
+            if let Some(ref udp) = udp {
+                for act in &actions {
+                    let _ = udp.send_to(&act.data, &act.target_ip, act.target_port);
+                }
+            }
+
+            // Heartbeat send
+            let hb_secs = { inner_tick.lock().unwrap().heartbeat_interval_secs };
+            if hb_secs > 0 && last_state == Some(IceState::Completed) {
+                let hb_ms = hb_secs as u64 * 1000;
+                if now_ms.saturating_sub(last_heartbeat_ms) >= hb_ms {
+                    last_heartbeat_ms = now_ms;
+                    let hb = encode_heartbeat_reply();
+                    let guard = inner_tick.lock().unwrap();
+                    if let Some(ref agent) = guard.ice_agent {
+                        if let Some(act) = agent.send_data(&hb) {
+                            if let Some(ref udp) = guard.ice_udp {
+                                let _ = udp.send_to(&act.data, &act.target_ip, act.target_port);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Heartbeat timeout detection
+            if hb_secs > 0 && last_state == Some(IceState::Completed) {
+                let timeout = Duration::from_secs(hb_secs as u64 * 2);
+                let timed_out = {
+                    let guard = inner_tick.lock().unwrap();
+                    guard
+                        .last_recv_instant
+                        .map(|t| t.elapsed() >= timeout)
+                        .unwrap_or(false)
+                };
+                if timed_out {
+                    fire_state_change(&inner_tick, IceState::Disconnected);
+                }
+            }
+
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+
+    let recv_handle = thread::spawn(move || {
+        while !stop_recv.load(Ordering::Relaxed) {
+            let udp = { inner_recv.lock().unwrap().ice_udp.clone() };
+            let udp = match udp {
+                Some(u) => u,
+                None => {
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+            };
+
+            match udp.recv_from(200) {
+                Ok((data, from_ip, from_port)) => {
+                    let result = {
+                        let mut guard = inner_recv.lock().unwrap();
+                        match &mut guard.ice_agent {
+                            Some(agent) => agent.handle_incoming_data(&data, &from_ip, from_port),
+                            None => HandleDataResult {
+                                app_data: None,
+                                actions: Vec::new(),
+                            },
+                        }
+                    };
+                    for act in result.actions {
+                        let _ = udp.send_to(&act.data, &act.target_ip, act.target_port);
+                    }
+                    if let Some(app_data) = result.app_data {
+                        // Update last_recv_instant
+                        inner_recv.lock().unwrap().last_recv_instant = Some(Instant::now());
+
+                        // Auto-reply heartbeat
+                        let hb_secs = { inner_recv.lock().unwrap().heartbeat_interval_secs };
+                        if hb_secs > 0 {
+                            if let Some(parsed) = parse_frame(&app_data) {
+                                if parsed.frame_type == p2p_core::types::TYPE_HEARTBEAT {
+                                    let hb = encode_heartbeat_reply();
+                                    let guard = inner_recv.lock().unwrap();
+                                    if let Some(ref agent) = guard.ice_agent {
+                                        if let Some(act) = agent.send_data(&hb) {
+                                            let _ = udp
+                                                .send_to(&act.data, &act.target_ip, act.target_port);
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // Data frame → extract payload → callback
+                        if let Some(parsed) = parse_frame(&app_data) {
+                            if parsed.frame_type == p2p_core::types::TYPE_DATA {
+                                fire_on_data(&inner_recv, parsed.payload);
+                            }
+                        }
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+    });
+
+    let mut guard = inner.lock().unwrap();
+    guard.tick_handle = Some(tick_handle);
+    guard.recv_handle = Some(recv_handle);
+}
+
+fn fire_state_change(inner: &Arc<Mutex<ClientInner>>, state: IceState) {
+    let guard = inner.lock().unwrap();
+    if let Some(ref cb) = guard.on_state_change {
+        cb(state);
+    }
+}
+
+fn fire_on_data(inner: &Arc<Mutex<ClientInner>>, payload: Vec<u8>) {
+    let guard = inner.lock().unwrap();
+    if let Some(ref cb) = guard.on_data {
+        cb(payload);
     }
 }
 

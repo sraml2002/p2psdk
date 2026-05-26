@@ -13,6 +13,29 @@ pub use http::SyncHttpTransport;
 pub use ws::SyncSignalingTransport;
 pub use platform::StdPlatform;
 
+use p2p_io::traits::{HttpTransport, IoError, IoProvider, Platform, UdpTransport};
+
+/// Synchronous I/O provider backed by std::net / reqwest / StdPlatform.
+pub struct SyncIoProvider;
+
+impl IoProvider for SyncIoProvider {
+    fn create_udp(&self, port: u16) -> Result<Box<dyn UdpTransport>, IoError> {
+        SyncUdpTransport::bind_any(port).map(|u| Box::new(u) as Box<dyn UdpTransport>)
+    }
+
+    fn create_udp_v6(&self, port: u16) -> Result<Box<dyn UdpTransport>, IoError> {
+        SyncUdpTransport::bind_any_v6(port).map(|u| Box::new(u) as Box<dyn UdpTransport>)
+    }
+
+    fn create_http(&self) -> Box<dyn HttpTransport> {
+        Box::new(SyncHttpTransport::new())
+    }
+
+    fn get_local_addresses(&self) -> Vec<String> {
+        StdPlatform::new().get_local_addresses()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
