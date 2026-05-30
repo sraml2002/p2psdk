@@ -1,0 +1,8 @@
+{
+  "idsUrl": "{IDS服务的URL}",
+  "natUrl": "{NAT服务的URL}",
+  "natTokenUrl": "{Token生成服务URL}",
+  "appId": "{宿主AppId}",
+  "userId": "{宿主App的用户ID}",
+  "odid": "{宿主App ODID}"
+}
