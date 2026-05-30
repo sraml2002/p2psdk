@@ -6,8 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use std::collections::VecDeque;
 
-use p2p_core::frame::{encode_data_frame, encode_heartbeat_reply, parse_frame, ParsedFrame};
+use p2p_core::frame::{encode_data_frame, encode_data_frame_with_seq, encode_heartbeat_reply, parse_frame, ParsedFrame};
 use p2p_core::ice::agent::{HandleDataResult, IceAction, IceAgent, IceAgentConfig};
 use p2p_core::ice::check_list::calc_candidate_priority;
 use p2p_core::sdp::{generate_sdp_offer, parse_sdp_answer};
@@ -77,6 +78,9 @@ struct ClientInner {
     // Heartbeat
     heartbeat_interval_secs: u32,
     last_recv_instant: Option<Instant>,
+
+    // seqId queue for automatic request-response correlation
+    pending_seq_ids: Mutex<VecDeque<u64>>,
 }
 
 impl ClientInner {
@@ -99,6 +103,7 @@ impl ClientInner {
             on_data: None,
             heartbeat_interval_secs: 0,
             last_recv_instant: None,
+            pending_seq_ids: Mutex::new(VecDeque::new()),
         }
     }
 }
@@ -753,8 +758,15 @@ impl P2pClient {
     }
 
     /// Send a text message as a P2P data frame (auto-send).
+    /// Automatically picks up a pending seqId from the queue for response correlation.
     pub fn send_text(&self, text: &str) -> Result<(), String> {
-        let frame = encode_data_frame(text);
+        let seq_id = self.inner.lock().unwrap()
+            .pending_seq_ids.lock().unwrap().pop_front().unwrap_or(0);
+        let frame = if seq_id > 0 {
+            encode_data_frame_with_seq(text, seq_id)
+        } else {
+            encode_data_frame(text)
+        };
         self.send_data(&frame)
     }
 
@@ -1201,6 +1213,11 @@ fn start_ice_threads(inner: &Arc<Mutex<ClientInner>>) {
                         // Data frame → extract payload → callback
                         if let Some(parsed) = parse_frame(&app_data) {
                             if parsed.frame_type == p2p_core::types::TYPE_DATA {
+                                if parsed.seq_id > 0 {
+                                    inner_recv.lock().unwrap()
+                                        .pending_seq_ids.lock().unwrap()
+                                        .push_back(parsed.seq_id);
+                                }
                                 fire_on_data(&inner_recv, parsed.payload);
                             }
                         }

@@ -8,14 +8,15 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use std::collections::VecDeque;
 
-use p2p_core::frame::{encode_data_frame, encode_heartbeat_reply, parse_frame};
+use p2p_core::frame::{encode_data_frame, encode_data_frame_with_seq, encode_heartbeat_reply, parse_frame};
 use p2p_core::ice::agent::{HandleDataResult, IceAgent, IceAgentConfig};
 use p2p_core::ice::check_list::calc_candidate_priority;
 use p2p_core::stun::client::get_external_address;
 use p2p_core::types::{
     ConnectorMessage, IceCandidate, IceCandidateMessage, IceDataMessage,
-    IceSessionDescription, CandidateType, IceState, TYPE_HEARTBEAT,
+    IceSessionDescription, CandidateType, IceState, TYPE_HEARTBEAT, TYPE_DATA,
 };
 use p2p_io::traits::{HttpTransport, Platform, UdpTransport};
 use p2p_sdk::config::Config;
@@ -87,6 +88,7 @@ struct Inner {
     threads: ThreadHandles,
     connector_tx: Option<mpsc::Sender<OutgoingConnectorMsg>>,
     heartbeat_interval: u32,
+    pending_seq_ids: Mutex<VecDeque<u64>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +118,7 @@ static GLOBAL_INNER: once_cell::sync::Lazy<Arc<Mutex<Inner>>> =
             threads: ThreadHandles::new(),
             connector_tx: None,
             heartbeat_interval: 0,
+            pending_seq_ids: Mutex::new(VecDeque::new()),
         }))
     });
 
@@ -267,7 +270,12 @@ pub fn send_text(text: &str) -> i32 {
     }
 
     // Fall back to Inner's ice_agent (connector ICE)
-    let frame = encode_data_frame(text);
+    let seq_id = guard.pending_seq_ids.lock().unwrap().pop_front().unwrap_or(0);
+    let frame = if seq_id > 0 {
+        encode_data_frame_with_seq(text, seq_id)
+    } else {
+        encode_data_frame(text)
+    };
     let (action, udp) = {
         let agent = match guard.ice_agent.as_ref() {
             Some(a) => a,
@@ -835,6 +843,14 @@ fn start_ice_threads_inner(inner: &Arc<Mutex<Inner>>) {
                                     }
                                     continue;
                                 }
+                            }
+                        }
+                        // Extract seqId from data frame for automatic response correlation
+                        if let Some(parsed) = parse_frame(&app_data) {
+                            if parsed.frame_type == TYPE_DATA && parsed.seq_id > 0 {
+                                inner_recv.lock().unwrap()
+                                    .pending_seq_ids.lock().unwrap()
+                                    .push_back(parsed.seq_id);
                             }
                         }
                         hilog::log_info(&format!("ICE app data: {} bytes", app_data.len()));

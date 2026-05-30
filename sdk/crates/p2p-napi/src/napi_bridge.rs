@@ -620,62 +620,42 @@ extern "C" fn encode_heartbeat_reply(env: NapiEnv, _info: NapiCallbackInfo) -> N
 extern "C" fn parse_frame(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
     let (argc, args) = unsafe { get_cb_args(env, info, 1) };
     if argc < 1 {
-        let mut js_obj: NapiValue = ptr::null_mut();
-        unsafe {
-            napi_create_object(env, &mut js_obj);
-            let type_val = { let mut v: NapiValue = ptr::null_mut(); napi_create_uint32(env, 0, &mut v); v };
-            napi_set_named_property(env, js_obj, b"type\0".as_ptr() as *const c_char, type_val);
-            let payload_val = return_arraybuffer(env, &[]);
-            napi_set_named_property(env, js_obj, b"payload\0".as_ptr() as *const c_char, payload_val);
-        }
-        return js_obj;
+        return make_parse_frame_result(env, 0, "0", &[]);
     }
     let data = match read_napi_arraybuffer(env, args[0]) {
         Some(b) => b,
-        None => {
-            let mut js_obj: NapiValue = ptr::null_mut();
-            unsafe {
-                napi_create_object(env, &mut js_obj);
-                let type_val = { let mut v: NapiValue = ptr::null_mut(); napi_create_uint32(env, 0, &mut v); v };
-                napi_set_named_property(env, js_obj, b"type\0".as_ptr() as *const c_char, type_val);
-                let payload_val = return_arraybuffer(env, &[]);
-                napi_set_named_property(env, js_obj, b"payload\0".as_ptr() as *const c_char, payload_val);
-            }
-            return js_obj;
-        }
+        None => return make_parse_frame_result(env, 0, "0", &[]),
     };
     match p2p_core::frame::parse_frame(&data) {
         Some(parsed) => {
-            let mut js_obj: NapiValue = ptr::null_mut();
-            unsafe {
-                napi_create_object(env, &mut js_obj);
-                let type_val = {
-                    let mut v: NapiValue = ptr::null_mut();
-                    napi_create_uint32(env, parsed.frame_type, &mut v);
-                    v
-                };
-                napi_set_named_property(env, js_obj, b"type\0".as_ptr() as *const c_char, type_val);
-                let payload_val = return_arraybuffer(env, &parsed.payload);
-                napi_set_named_property(env, js_obj, b"payload\0".as_ptr() as *const c_char, payload_val);
-            }
-            js_obj
+            let seq_str = parsed.seq_id.to_string();
+            make_parse_frame_result(env, parsed.frame_type, &seq_str, &parsed.payload)
         }
-        None => {
-            let mut js_obj: NapiValue = ptr::null_mut();
-            unsafe {
-                napi_create_object(env, &mut js_obj);
-                let type_val = {
-                    let mut v: NapiValue = ptr::null_mut();
-                    napi_create_uint32(env, 0, &mut v);
-                    v
-                };
-                napi_set_named_property(env, js_obj, b"type\0".as_ptr() as *const c_char, type_val);
-                let payload_val = return_arraybuffer(env, &[]);
-                napi_set_named_property(env, js_obj, b"payload\0".as_ptr() as *const c_char, payload_val);
-            }
-            js_obj
-        }
+        None => make_parse_frame_result(env, 0, "0", &[]),
     }
+}
+
+fn make_parse_frame_result(env: NapiEnv, frame_type: u32, seq_id_str: &str, payload: &[u8]) -> NapiValue {
+    let mut js_obj: NapiValue = ptr::null_mut();
+    unsafe {
+        napi_create_object(env, &mut js_obj);
+        let type_val = {
+            let mut v: NapiValue = ptr::null_mut();
+            napi_create_uint32(env, frame_type, &mut v);
+            v
+        };
+        napi_set_named_property(env, js_obj, b"type\0".as_ptr() as *const c_char, type_val);
+        let seq_id_bytes = format!("{}\0", seq_id_str);
+        let seq_id_val = {
+            let mut v: NapiValue = ptr::null_mut();
+            napi_create_string_utf8(env, seq_id_bytes.as_ptr() as *const c_char, seq_id_str.len(), &mut v);
+            v
+        };
+        napi_set_named_property(env, js_obj, b"seqId\0".as_ptr() as *const c_char, seq_id_val);
+        let payload_val = return_arraybuffer(env, payload);
+        napi_set_named_property(env, js_obj, b"payload\0".as_ptr() as *const c_char, payload_val);
+    }
+    js_obj
 }
 
 extern "C" fn is_stun_message(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
