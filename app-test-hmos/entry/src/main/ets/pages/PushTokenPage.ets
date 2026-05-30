@@ -1,4 +1,3 @@
-import { router } from '@kit.ArkUI'
 import { pasteboard } from '@kit.BasicServicesKit'
 
 @Entry
@@ -9,7 +8,7 @@ struct PushTokenPage {
   @State hasError: boolean = false
 
   aboutToAppear(): void {
-    const params = router.getParams() as Record<string, string>
+    const params = this.getUIContext().getRouter().getParams() as Record<string, string>
     if (params && params['token']) {
       this.token = params['token']
     } else {
@@ -18,13 +17,17 @@ struct PushTokenPage {
   }
 
   copyToken(): void {
-    const pasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, this.token)
-    const systemPasteboard = pasteboard.getSystemPasteboard()
-    systemPasteboard.setDataSync(pasteData)
-    this.copyResult = '已复制到剪贴板'
-    setTimeout(() => {
-      this.copyResult = ''
-    }, 2000)
+    try {
+      const pasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, this.token)
+      const systemPasteboard = pasteboard.getSystemPasteboard()
+      systemPasteboard.setDataSync(pasteData)
+      this.copyResult = '已复制到剪贴板'
+      setTimeout(() => {
+        this.copyResult = ''
+      }, 2000)
+    } catch (e) {
+      this.copyResult = '复制失败'
+    }
   }
 
   build() {
@@ -71,7 +74,7 @@ struct PushTokenPage {
           .borderRadius(20)
           .padding({ left: 24, right: 24, top: 10, bottom: 10 })
           .onClick(() => {
-            router.back()
+            this.getUIContext().getRouter().back()
           })
 
         if (!this.hasError) {

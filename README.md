@@ -171,15 +171,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 2. ArkTS 应用集成
 
-第三方 HarmonyOS 应用通过 `libppsdk.so` 集成 P2P SDK。
+HarmonyOS Next应用通过napi方式集成P2P SDK（构建自动生成 `libppsdk.so` ）。
 
 ### 2.1 构建 libppsdk.so
 
-构建前需配置 JWT Token（同第 1 部分），并将 Token 文件绝对路径写入 `build.jwt.path`。
+构建前需线下获取访问NAT服务的JWT Token、保存到本地文件（同第 1 部分），并将 JWT Token 文件的绝对路径写入 `build.jwt.path`。
 
 **方式一：DevEco Studio 构建**
 
-在 DevEco Studio 中打开 `app-test-hmos/` 项目，手动点击 Build > Build Hap(s)/APP(s)。构建过程中，自定义 hvigor 插件（`entry/hvigorfile.ts`）会自动调用 `build-arkts-napi-so.sh` 完成 Rust 编译和 .so 复制。
+在 DevEco Studio 中打开 `app-test-hmos/` 项目，手动点击 Build > Build Hap(s)/APP(s)。构建过程中，自定义 hvigor 插件（`entry/hvigorfile.ts`）会自动调用 `build-arkts-napi-so.sh` 完成 Rust 编译和 libppsdk.so 复制到目标目录。
 
 **方式二：手动编译 .so**
 

@@ -1,6 +1,6 @@
 # P2P SDK (Rust) — 系统设计文档
 
-> 最后更新: 2026-05-18
+> 最后更新: 2026-05-27
 
 ---
 
@@ -8,28 +8,16 @@
 
 ### 1.1 系统定位
 
-本项目是 P2P SDK 的 **全 Rust 重写版本**，替代原 ArkTS + C++ (mbedTLS) 方案。核心目标不变：为 HarmonyOS 设备端提供与另一节点快速建立 P2P 连接的能力。
+**P2P SDK** 是一个用纯 Rust 实现的 P2P 连接建立 SDK。它的核心目标是：为上层应用提供与对端（终端或云服务）基于 ICE 协议快速建立 P2P 连接的能力，同时屏蔽 ICE/STUN/TURN/DTLS/SDP/NAT 等底层协议的复杂实现。
 
-**与原版的关键差异：**
+**交付件与集成方式：**
 
-| 维度 | 原版 (ArkTS + C++) | 本版 (全 Rust) |
-|------|-------------------|---------------|
-| 协议实现 | ArkTS (IceAgent/IceStun/StunClient) | Rust (p2p-core) |
-| DTLS 加密 | C++ mbedTLS NAPI | Rust DTLS（p2p-core 内置） |
-| NAPI 桥接 | C++ napi.cpp + ArkTS import | Rust raw NAPI (.init_array) |
-| I/O | ArkTS UDPSocket + Node-API | Rust std::net / reqwest / tungstenite |
-| 类型桥接 | ETS 封装层 (hex 编码 + JSON 解析) | 直接 NAPI Object + ArrayBuffer |
-| 可测试性 | 需设备或模拟器 | 桌面端可单元测试 |
+| 集成方式 | 交付件 | 适用场景 |
+|---------|--------|---------|
+| **ArkTS 应用** | `libppsdk.so` + `index.d.ts` | HarmonyOS 应用通过 NAPI 调用 |
+| **Rust 应用** | SDK crate 依赖 | Rust 程序直接依赖，编译为单一可执行文件 |
 
-**交付件与边界：**
-
-| 层 | 角色 | 说明 |
-|---|------|------|
-| **Rust SDK** (libppsdk.so) | 核心交付件 | 通用库，封装 ICE/STUN/TURN/DTLS/SDP/Token 全部协议逻辑 |
-| **类型声明** (index.d.ts) | 类型声明 | `cpp/types/libppsdk/index.d.ts`，供 IDE 类型提示和构建系统验证 |
-| **HarmonyOS App** | 功能验证工具 | 非 SDK 交付件，仅用于端到端功能验证 |
-
-开发者集成只需 `libppsdk.so` + `index.d.ts` 两个文件，无需 ETS 封装层。
+两种集成方式共享同一套 Rust 协议实现（p2p-core），上层接口语义一致。
 
 **核心能力：**
 
@@ -42,43 +30,42 @@
 ### 1.2 外部服务交互关系
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│         HarmonyOS App (功能验证, 非交付件)                            │
-│                                                                     │
-│  ┌──────────┐  ┌──────────┐                                        │
-│  │ Index    │  │ IdsPage  │  UI 交互                                │
-│  └────┬─────┘  └────┬─────┘                                        │
-│       │              │                                              │
-│       │  import ppsdk from 'libppsdk.so'                           │
-│       │  直接调用 ppsdk.xxx()，无需 ETS 封装层                       │
-│       │              │                                              │
-├───────┼──────────────┼──────────────────────────────────────────────┤
-│       │  Raw NAPI (libppsdk.so)                                     │
-│  ┌────▼──────────────▼───────────────────────────────────────────┐  │
-│  │                    Rust SDK (核心交付件)                        │  │
-│  │                                                               │  │
-│  │  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────┐ │  │
-│  │  │  p2p-napi    │  │  p2p-sdk     │  │  p2p-tokio          │ │  │
-│  │  │  NAPI 桥接    │  │  SDK 门面    │  │  同步 I/O           │ │  │
-│  │  │  TSFN 回调   │  │  P2pClient   │  │  UDP/HTTP/WS        │ │  │
-│  │  └──────┬───────┘  └──────┬───────┘  └──────────┬──────────┘ │  │
-│  │         │                 │                      │            │  │
-│  │  ┌──────▼─────────────────▼──────────────────────▼──────────┐ │  │
-│  │  │                    p2p-core                              │ │  │
-│  │  │  Sans-IO 协议核心                                        │ │  │
-│  │  │  IceAgent / STUN / TURN / SDP / Frame / Crypto  │ │  │
-│  │  └─────────────────────────────────────────────────────────┘ │  │
-│  │                                                              │  │
-│  │  ┌──────────────────┐  ┌──────────────────┐                  │  │
-│  │  │    p2p-io         │  │    dimpl          │                  │  │
-│  │  │  I/O traits       │  │  DER 编码         │                  │  │
-│  │  └──────────────────┘  └──────────────────┘                  │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-└────────┬─────────────┬──────────────┬──────────────┬──────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          App 层                                          │
+│                                                                         │
+│  ┌──────────────────────────┐    ┌──────────────────────────────────┐   │
+│  │  ArkTS 应用              │    │  Rust 应用                       │   │
+│  │  import ppsdk from       │    │  use p2p_sdk::P2pClient;        │   │
+│  │    'libppsdk.so'         │    │  直接依赖 SDK crate              │   │
+│  └──────────┬───────────────┘    └──────────────┬───────────────────┘   │
+│             │  NAPI (libppsdk.so)               │  crate 依赖           │
+├─────────────┼───────────────────────────────────┼───────────────────────┤
+│             │                                   │                       │
+│  ┌──────────▼───────────────────────────────────▼────────────────────┐  │
+│  │                      P2P SDK (核心交付件)                          │  │
+│  │                                                                   │  │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────┐     │  │
+│  │  │  p2p-napi    │  │  p2p-sdk     │  │  p2p-tokio          │     │  │
+│  │  │  NAPI 桥接    │  │  SDK 门面    │  │  同步 I/O           │     │  │
+│  │  │  TSFN 回调   │  │  P2pClient   │  │  UDP/HTTP/WS        │     │  │
+│  │  └──────┬───────┘  └──────┬───────┘  └──────────┬──────────┘     │  │
+│  │         │                 │                      │                │  │
+│  │  ┌──────▼─────────────────▼──────────────────────▼──────────────┐ │  │
+│  │  │                      p2p-core                                │ │  │
+│  │  │  Sans-IO 协议核心                                            │ │  │
+│  │  │  IceAgent / STUN / TURN / SDP / Frame / Crypto              │ │  │
+│  │  └─────────────────────────────────────────────────────────────┘ │  │
+│  │                                                                  │  │
+│  │  ┌──────────────────┐  ┌──────────────────┐                     │  │
+│  │  │    p2p-io         │  │    dimpl          │                     │  │
+│  │  │  I/O traits       │  │  DER 编码         │                     │  │
+│  │  └──────────────────┘  └──────────────────┘                     │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+└────────┬─────────────┬──────────────┬──────────────┬──────────────────┘
          │             │              │              │
 ┌────────▼─────┐ ┌────▼───────┐ ┌───▼──────────┐ ┌▼───────────────┐
-│ 华为云 NAT   │ │ STUN/TURN  │ │ IDS 身份服务  │ │ Connector WS   │
-│ 路由服务     │ │ 服务器     │ │              │ │ (开发调试)     │
+│ NAT 路由服务  │ │ STUN/TURN  │ │ IDS 身份服务  │ │ Connector WS   │
+│              │ │ 服务器     │ │              │ │ (开发调试)     │
 └──────────────┘ └────────────┘ └────────────┘ └────────────────┘
 ```
 
@@ -86,7 +73,7 @@
 
 | # | 外部服务 | 协议 | 用途 |
 |---|---------|------|------|
-| 1 | 华为云 NAT 路由服务 | HTTPS POST | 获取 STUN/TURN 服务器地址 |
+| 1 | NAT 路由服务 | HTTPS POST | 获取 STUN/TURN 服务器地址 |
 | 2 | STUN 服务器 | UDP + DTLS 1.2 | NAT 探测，获取公网映射地址 (srflx) |
 | 3 | TURN 服务器 | UDP + DTLS 1.2 | 分配中继地址 (relay) |
 | 4 | IDS 身份服务 | HTTP REST | 设备注册 & 对端查询 |
@@ -192,18 +179,19 @@ IceAgent (Sans-IO)
 - **NAPI Object 返回**：`gatherCandidates`/`registerIds`/`queryIds` 通过 `napi_create_object` + `napi_set_named_property` 返回结构化对象，无需 JSON 字符串中转
 - **帧编解码导出**：`encodeDataFrame`/`encodeHeartbeatReply`/`parseFrame`/`isStunMessage` 直接通过 NAPI 暴露，无需 ArkTS 侧实现
 
-### 2.3 无 ETS 封装层设计
+### 2.3 NAPI 数据传递机制
 
-App 直接通过 `import ppsdk from 'libppsdk.so'` 调用所有 SDK 功能，无需 ETS 中间封装。类型声明通过 `cpp/types/libppsdk/index.d.ts` 提供。
+ArkTS 应用通过 `import ppsdk from 'libppsdk.so'` 直接调用 SDK 功能，类型声明由 `cpp/types/libppsdk/index.d.ts` 提供。数据在 NAPI 层直接转换，无需中间封装层。
 
-**数据转换下沉到 NAPI 层：**
+**数据转换机制：**
 
-| 旧方式（ETS 封装层） | 新方式（NAPI 直传） |
-|---------------------|-------------------|
-| send: ArrayBuffer → hex string → Rust | send: ArrayBuffer → `napi_get_arraybuffer_info` → `&[u8]` |
-| gatherCandidates: 返回 JSON string → ETS 解析 | gatherCandidates: 返回 NAPI Object（`napi_create_object`） |
-| registerIds/queryIds: 返回 JSON string → ETS 解析 | registerIds/queryIds: 返回 NAPI Object |
-| 帧编解码: ETS 侧实现 | encodeDataFrame/parseFrame: Rust NAPI 导出 |
+| 方向 | 转换方式 |
+|------|---------|
+| ArkTS → Rust（二进制） | `ArrayBuffer` → `napi_get_arraybuffer_info` → `&[u8]` |
+| ArkTS → Rust（字符串） | `string` → `napi_get_value_string_utf8` → `&str` |
+| Rust → ArkTS（二进制） | `&[u8]` → `napi_create_arraybuffer` → `ArrayBuffer` |
+| Rust → ArkTS（对象） | `napi_create_object` + `napi_set_named_property` → 结构化对象 |
+| Rust → ArkTS（回调） | TSFN (`napi_create_threadsafe_function`) → ArkTS function |
 
 **ArkTS 严格模式兼容：**
 
@@ -220,7 +208,30 @@ const reply: ArrayBuffer = ppsdk.encodeHeartbeatReply()
 
 ## 三、关键数据流
 
-### 3.1 候选地址收集
+### 3.1 获取对端地址
+
+通过 IDS 服务完成设备注册和对端查询，获取对端的信令地址。
+
+```
+ppsdk.registerIds(appId, userId, odid, pushToken)
+  │
+  ├── HTTP POST /api/ids
+  │     body: { appId, userId, type: "app", odid, token: pushToken }
+  │     → 注册本端信息
+  │
+  ▼
+ppsdk.queryIds(appId, userId)
+  │
+  ├── HTTP GET /api/ids/{appId}/{userId}
+  │     → 返回对端记录列表
+  │
+  ├── 遍历记录，查找 type="service" 的条目
+  │     └── record.token 即为对端信令地址
+  │
+  ▼  获得对端信令地址（peerId），用于后续 P2P 建链
+```
+
+### 3.2 候选地址收集
 
 ```
 ppsdk.gatherCandidates(token)
@@ -258,7 +269,7 @@ client_napi::gather_candidates(token)
   │  返回 NAPI Object { candidateLines, localAddresses, ... }
 ```
 
-### 3.2 SDP 连接流程 (设备↔云服务)
+### 3.3 P2P建链协商（设备↔云服务）
 
 ```
 ppsdk.connectViaSdp(url, peerId)
@@ -286,7 +297,7 @@ connect_via_sdp_bg_inner()
               onStateChange("COMPLETED") → this.connected = true → 聊天 UI 出现
 ```
 
-### 3.3 Connector 信令流程 (设备↔设备，开发调试)
+### 3.4 P2P建链协商（设备↔设备，开发调试）
 
 ```
 设备A (Initiator)                          设备B (Responder)
@@ -355,12 +366,12 @@ Rust 后台线程：
 
 | 决策 | 原因 |
 |------|------|
-| **全 Rust** | 替代 ArkTS + C++ 双语言方案，统一技术栈，消除跨语言桥接的复杂性 |
-| **Sans-IO 架构** | 协议逻辑不持有 I/O 资源，桌面端可单元测试全流程 |
+| **全 Rust** | 统一技术栈，单一语言覆盖协议实现、NAPI 桥接、I/O 全链路 |
+| **Sans-IO 架构** | 协议逻辑不持有 I/O 资源，桌面端可直接单元测试全流程 |
 | **Raw NAPI (.init_array)** | 不依赖 napi-ohos crate，减少编译依赖，更可控的内存管理 |
-| **同步阻塞 I/O** | 匹配 NAPI 同步调用语义，避免引入 tokio async runtime 与 NAPI 事件循环冲突 |
+| **同步阻塞 I/O** | 匹配 NAPI 同步调用语义，避免引入 async runtime 与 NAPI 事件循环冲突 |
 | **ThreadsafeFunction** | Rust 后台线程安全回调到 ArkTS JS 线程，NAPI 标准机制 |
-| **ArrayBuffer 直传** | send 通过 `napi_get_arraybuffer_info` 直接传递二进制，无需 hex 编码 |
-| **NAPI Object 返回** | 通过 `napi_create_object` + `napi_set_named_property` 返回结构化对象，ArkTS 无需 JSON 解析 |
-| **帧编解码 NAPI 导出** | p2p-core 的帧编解码直接通过 NAPI 暴露，无需 ArkTS 侧重复实现 |
+| **ArrayBuffer 直传** | send 通过 `napi_get_arraybuffer_info` 直接传递二进制，无编码开销 |
+| **NAPI Object 返回** | 通过 `napi_create_object` + `napi_set_named_property` 返回结构化对象，App 无需 JSON 解析 |
+| **帧编解码 NAPI 导出** | p2p-core 的帧编解码直接通过 NAPI 暴露，App 层无需重复实现 |
 | **全局单例** | NAPI 模块只有一个实例，`once_cell::Lazy<Arc<Mutex<Inner>>>` |

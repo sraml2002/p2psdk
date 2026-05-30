@@ -12,11 +12,10 @@ use std::time::Duration;
 use p2p_core::frame::{encode_data_frame, encode_heartbeat_reply, parse_frame};
 use p2p_core::ice::agent::{HandleDataResult, IceAgent, IceAgentConfig};
 use p2p_core::ice::check_list::calc_candidate_priority;
-use p2p_core::stun::client::{get_external_address, get_turn_relay_address};
-use p2p_core::ice::candidate::format_candidate_line;
+use p2p_core::stun::client::get_external_address;
 use p2p_core::types::{
     ConnectorMessage, IceCandidate, IceCandidateMessage, IceDataMessage,
-    IceSessionDescription, CandidateType, IceState, AF_INET, AF_INET6, TYPE_HEARTBEAT,
+    IceSessionDescription, CandidateType, IceState, TYPE_HEARTBEAT,
 };
 use p2p_io::traits::{HttpTransport, Platform, UdpTransport};
 use p2p_sdk::config::Config;
@@ -38,8 +37,8 @@ use crate::napi_bridge;
 struct NatRoute {
     stun_ip: String,
     stun_port: u16,
-    turn_ip: String,
-    turn_port: u16,
+    _turn_ip: String,
+    _turn_port: u16,
 }
 
 struct ThreadHandles {
@@ -75,12 +74,12 @@ struct Inner {
     nat_route: Option<NatRoute>,
     stun_external_ip: String,
     stun_external_port: u16,
-    stun_external_ip_v6: String,
-    stun_external_port_v6: u16,
+    _stun_external_ip_v6: String,
+    _stun_external_port_v6: u16,
     turn_relay_ip: String,
     turn_relay_port: u16,
-    turn_relay_ip_v6: String,
-    turn_relay_port_v6: u16,
+    _turn_relay_ip_v6: String,
+    _turn_relay_port_v6: u16,
     connector_registered: bool,
     identifier: String,
     cached_p2p_token: String,
@@ -104,12 +103,12 @@ static GLOBAL_INNER: once_cell::sync::Lazy<Arc<Mutex<Inner>>> =
             nat_route: None,
             stun_external_ip: String::new(),
             stun_external_port: 0,
-            stun_external_ip_v6: String::new(),
-            stun_external_port_v6: 0,
+            _stun_external_ip_v6: String::new(),
+            _stun_external_port_v6: 0,
             turn_relay_ip: String::new(),
             turn_relay_port: 0,
-            turn_relay_ip_v6: String::new(),
-            turn_relay_port_v6: 0,
+            _turn_relay_ip_v6: String::new(),
+            _turn_relay_port_v6: 0,
             connector_registered: false,
             identifier: String::new(),
             cached_p2p_token: String::new(),
@@ -139,14 +138,16 @@ pub fn init(config_json: &str) -> i32 {
     let mut inner = get_inner().lock().unwrap();
     inner.ids_url = config.get("idsUrl").and_then(|v| v.as_str()).unwrap_or("").into();
     inner.nat_url = config.get("natUrl").and_then(|v| v.as_str()).unwrap_or("").into();
+    let nat_token_url: String = config.get("natTokenUrl").and_then(|v| v.as_str()).unwrap_or("").into();
 
     let sdk_config = Config {
         ids_url: inner.ids_url.clone(),
         nat_url: inner.nat_url.clone(),
+        nat_token_url: nat_token_url.clone(),
     };
     inner.p2p_client.init(sdk_config);
 
-    hilog::log_info(&format!("init: ids={}, nat={}", inner.ids_url, inner.nat_url));
+    hilog::log_info(&format!("init: ids={}, nat={}, natTokenUrl={}", inner.ids_url, inner.nat_url, nat_token_url));
     0
 }
 

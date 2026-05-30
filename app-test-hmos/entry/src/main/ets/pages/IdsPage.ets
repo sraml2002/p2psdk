@@ -6,7 +6,6 @@
  *   Step 2: Query IDS for HSService
  *   Step 3: connect (one-stop P2P) → chat
  */
-import { router } from '@kit.ArkUI'
 import { hilog } from '@kit.PerformanceAnalysisKit'
 import { pushService } from '@kit.PushKit'
 import { deviceInfo } from '@kit.BasicServicesKit'
@@ -53,13 +52,14 @@ struct IdsPage {
   @State isRegistering: boolean = false
   @State registerStatus: string = ''
 
-  private config: AppConfig = { idsUrl: '', natUrl: '', appId: '', userId: '' }
+  private config: AppConfig = { idsUrl: '', natUrl: '', natTokenUrl: '', appId: '', userId: '' }
 
   aboutToAppear(): void {
-    this.config = loadAppConfig(getContext(this))
+    this.config = loadAppConfig(this.getUIContext().getHostContext() as Context)
     ppsdk.init(JSON.stringify({
       idsUrl: this.config.idsUrl,
       natUrl: this.config.natUrl,
+      natTokenUrl: this.config.natTokenUrl,
     }))
 
     ppsdk.onStateChange((state: string): void => {
@@ -223,7 +223,7 @@ struct IdsPage {
           .backgroundColor('#999999')
           .borderRadius(12)
           .onClick(() => {
-            router.back()
+            this.getUIContext().getRouter().back()
           })
         Text('IDS P2P Chat')
           .fontSize(18)

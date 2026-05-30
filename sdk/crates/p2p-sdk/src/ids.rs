@@ -7,6 +7,7 @@ use p2p_io::traits::HttpTransport;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[allow(non_snake_case)]
 pub struct IdsRecord {
     pub appId: String,
     pub userId: String,

@@ -67,10 +67,17 @@ export default class EntryAbility extends UIAbility {
         }
       });
       // 请求通知权限
-      notificationManager.requestEnableNotification().then(() => {
-        hilog.info(DOMAIN, 'testTag', '[V2] Notification permission granted');
+      notificationManager.isNotificationEnabled().then((enabled: boolean) => {
+        if (!enabled) {
+          notificationManager.requestEnableNotification(this.context).then(() => {
+            hilog.info(DOMAIN, 'testTag', '[V2] Notification permission granted');
+          }).catch((err: BusinessError) => {
+            hilog.error(DOMAIN, 'testTag',
+              '[V2] Request notification permission failed: %{public}d %{public}s', err.code, err.message);
+          });
+        }
       }).catch((err: BusinessError) => {
-        hilog.error(DOMAIN, 'testTag', '[V2] Request notification permission failed: %{public}d %{public}s',
+        hilog.error(DOMAIN, 'testTag', '[V2] isNotificationEnabled failed: %{public}d %{public}s',
           err.code, err.message);
       });
     } catch (err) {

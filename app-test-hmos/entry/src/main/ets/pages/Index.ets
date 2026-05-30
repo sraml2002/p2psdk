@@ -1,5 +1,4 @@
 import { pushService } from '@kit.PushKit'
-import { router } from '@kit.ArkUI'
 import { hilog } from '@kit.PerformanceAnalysisKit'
 import ppsdk from 'libppsdk.so'
 import { loadAppConfig, AppConfig } from '../sdk/AppConfig'
@@ -38,10 +37,11 @@ struct Index {
     }
     this.updateTime()
     this.startTimer()
-    const config: AppConfig = loadAppConfig(getContext(this))
+    const config: AppConfig = loadAppConfig(this.getUIContext().getHostContext() as Context)
     ppsdk.init(JSON.stringify({
       idsUrl: config.idsUrl,
       natUrl: config.natUrl,
+      natTokenUrl: config.natTokenUrl,
     }))
   }
 
@@ -74,7 +74,7 @@ struct Index {
   getPushToken(): void {
     this.isGettingToken = true
     pushService.getToken().then((token: string) => {
-      router.pushUrl({ url: 'pages/PushTokenPage', params: { token: token } })
+      this.getUIContext().getRouter().pushUrl({ url: 'pages/PushTokenPage', params: { token: token } })
     }).catch((err: Error) => {
       hilog.error(0x0000, 'testTag', '[V2] getPushToken failed: %{public}s', JSON.stringify(err))
     }).finally(() => {
@@ -268,7 +268,7 @@ struct Index {
             .backgroundColor('#7B1FA2')
             .borderRadius(20)
             .onClick(() => {
-              router.pushUrl({ url: 'pages/IdsPage' })
+              this.getUIContext().getRouter().pushUrl({ url: 'pages/IdsPage' })
             })
 
           Button('P2P Chat')
@@ -278,7 +278,7 @@ struct Index {
             .backgroundColor('#E65100')
             .borderRadius(20)
             .onClick(() => {
-              router.pushUrl({ url: 'pages/IdsPage2' })
+              this.getUIContext().getRouter().pushUrl({ url: 'pages/IdsPage2' })
             })
         }
         .width('100%')

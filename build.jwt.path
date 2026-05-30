@@ -1,3 +1,3 @@
 #NAT服务认证Token文件路径（线下申请）
 #填入本机 build.jwt.nogit 文件的绝对路径，例如：
-/home/user/data/build.jwt.nogit
+/Users/sram/dev/claudecode/tools/build.jwt.nogit

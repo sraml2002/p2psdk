@@ -3,7 +3,6 @@
  *
  * Single flow: init → registerIds → queryIds → connect → chat
  */
-import { router } from '@kit.ArkUI'
 import { hilog } from '@kit.PerformanceAnalysisKit'
 import { pushService } from '@kit.PushKit'
 import { deviceInfo } from '@kit.BasicServicesKit'
@@ -45,10 +44,10 @@ struct IdsPage2 {
   @State connectTimeMs: number = 0
 
   private connectStartTime: number = 0
-  private config: AppConfig = { idsUrl: '', natUrl: '', appId: '', userId: '' }
+  private config: AppConfig = { idsUrl: '', natUrl: '', natTokenUrl: '', appId: '', userId: '' }
 
   aboutToAppear(): void {
-    this.config = loadAppConfig(getContext(this))
+    this.config = loadAppConfig(this.getUIContext().getHostContext() as Context)
     ppsdk.onStateChange((state: string): void => {
       this.appendLog(`ICE state: ${state}`)
       if (state === 'COMPLETED' || state === 'CONNECTED') {
@@ -110,6 +109,7 @@ struct IdsPage2 {
     const initCode: number = ppsdk.init(JSON.stringify({
       idsUrl: this.config.idsUrl,
       natUrl: this.config.natUrl,
+      natTokenUrl: this.config.natTokenUrl,
     }))
     if (initCode !== 0) {
       this.setError('init 失败')
@@ -208,7 +208,7 @@ struct IdsPage2 {
           .backgroundColor('#999999')
           .borderRadius(12)
           .onClick(() => {
-            router.back()
+            this.getUIContext().getRouter().back()
           })
         Text('P2P Chat')
           .fontSize(18)

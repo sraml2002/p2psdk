@@ -21,6 +21,8 @@ struct AppConfig {
     ids_url: String,
     #[serde(rename = "natUrl")]
     nat_url: String,
+    #[serde(rename = "natTokenUrl", default)]
+    nat_token_url: String,
     #[serde(rename = "appId")]
     app_id: String,
     #[serde(rename = "userId")]
@@ -52,6 +54,7 @@ fn main() {
     client.init(Config {
         ids_url: config.ids_url.clone(),
         nat_url: config.nat_url.clone(),
+        nat_token_url: config.nat_token_url.clone(),
     });
 
     // 注册回调

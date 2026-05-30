@@ -13,6 +13,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 aes-gcm = { workspace = true }
+ureq = { version = "2", features = ["json"] }
 
 [build-dependencies]
 sha2 = { workspace = true }

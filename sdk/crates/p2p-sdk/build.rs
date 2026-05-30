@@ -61,6 +61,7 @@ fn main() {
     use aes_gcm::aead::Aead;
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
     let cipher = Aes256Gcm::new_from_slice(&aes_key).unwrap();
+    #[allow(deprecated)]
     let nonce = Nonce::from_slice(&iv_bytes);
     let encrypted = cipher
         .encrypt(nonce, jwt.as_bytes())

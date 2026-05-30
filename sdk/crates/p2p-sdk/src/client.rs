@@ -557,10 +557,8 @@ impl P2pClient {
                 .ok_or("not initialized — call init first")?
         };
 
-        let p2p_token = crate::token::generate_token();
-        if p2p_token.is_empty() {
-            return Err("failed to generate P2P token".into());
-        }
+        let p2p_token = crate::token::generate_token_with_url(&config.nat_token_url)
+            .map_err(|e| format!("failed to generate P2P token: {e}"))?;
 
         // Store heartbeat interval
         self.inner.lock().unwrap().heartbeat_interval_secs = heartbeat_interval_secs;
@@ -1219,9 +1217,16 @@ fn start_ice_threads(inner: &Arc<Mutex<ClientInner>>) {
 }
 
 fn fire_state_change(inner: &Arc<Mutex<ClientInner>>, state: IceState) {
-    let guard = inner.lock().unwrap();
-    if let Some(ref cb) = guard.on_state_change {
+    // Take the callback out of the lock so it can be called without holding inner.
+    // This avoids deadlock if the callback itself tries to acquire inner (e.g. send_data).
+    let cb = {
+        let mut guard = inner.lock().unwrap();
+        guard.on_state_change.take()
+    };
+    if let Some(cb) = cb {
         cb(state);
+        // Restore callback for future state changes
+        inner.lock().unwrap().on_state_change = Some(cb);
     }
 }
 

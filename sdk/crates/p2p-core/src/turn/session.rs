@@ -44,6 +44,7 @@ impl From<DtlsError> for TurnError {
 ///
 /// Created via `TurnSession::allocate()`. The underlying DTLS connection
 /// and UDP state are kept alive for subsequent `create_permission()` calls.
+#[allow(dead_code)]
 pub struct TurnSession {
     dtls: DtlsSession,
     turn_ip: String,
