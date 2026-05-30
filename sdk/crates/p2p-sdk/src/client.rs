@@ -1274,9 +1274,16 @@ fn fire_state_change(inner: &Arc<Mutex<ClientInner>>, state: IceState) {
 }
 
 fn fire_on_data(inner: &Arc<Mutex<ClientInner>>, payload: Vec<u8>) {
-    let guard = inner.lock().unwrap();
-    if let Some(ref cb) = guard.on_data {
+    // Take the callback out of the lock, same pattern as fire_state_change.
+    // This avoids blocking the recv thread while the callback executes,
+    // which could cause UDP packet loss under concurrent load.
+    let cb = {
+        let mut guard = inner.lock().unwrap();
+        guard.on_data.take()
+    };
+    if let Some(cb) = cb {
         cb(payload);
+        inner.lock().unwrap().on_data = Some(cb);
     }
 }
 
