@@ -74,6 +74,7 @@ struct ClientInner {
     // Callbacks
     on_state_change: Option<Box<dyn Fn(IceState) + Send>>,
     on_data: Option<Box<dyn Fn(Vec<u8>) + Send>>,
+    on_log: Option<Box<dyn Fn(&str) + Send>>,
 
     // Heartbeat
     heartbeat_interval_secs: u32,
@@ -101,6 +102,7 @@ impl ClientInner {
             ice_stop: Arc::new(AtomicBool::new(false)),
             on_state_change: None,
             on_data: None,
+            on_log: None,
             heartbeat_interval_secs: 0,
             last_recv_instant: None,
             pending_seq_ids: Mutex::new(VecDeque::new()),
@@ -152,6 +154,11 @@ impl P2pClient {
     /// heartbeat frames are handled internally and not reported).
     pub fn on_data(&self, cb: Box<dyn Fn(Vec<u8>) + Send>) {
         self.inner.lock().unwrap().on_data = Some(cb);
+    }
+
+    /// Register a diagnostic log callback.
+    pub fn on_log(&self, cb: Box<dyn Fn(&str) + Send>) {
+        self.inner.lock().unwrap().on_log = Some(cb);
     }
 
     // ── NAT route resolution ──────────────────────────────────────────────
@@ -762,6 +769,9 @@ impl P2pClient {
     pub fn send_text(&self, text: &str) -> Result<(), String> {
         let seq_id = self.inner.lock().unwrap()
             .pending_seq_ids.lock().unwrap().pop_front().unwrap_or(0);
+        sdk_log(&self.inner, &format!(
+            "[P2PSDK] send → seqId={}, text=\"{}\" ({} bytes)",
+            seq_id, text, text.len()));
         let frame = if seq_id > 0 {
             encode_data_frame_with_seq(text, seq_id)
         } else {
@@ -1213,13 +1223,29 @@ fn start_ice_threads(inner: &Arc<Mutex<ClientInner>>) {
                         // Data frame → extract payload → callback
                         if let Some(parsed) = parse_frame(&app_data) {
                             if parsed.frame_type == p2p_core::types::TYPE_DATA {
+                                let payload_len = parsed.payload.len();
                                 if parsed.seq_id > 0 {
+                                    sdk_log(&inner_recv, &format!(
+                                        "[P2PSDK] recv → seqId={}, payload={} bytes",
+                                        parsed.seq_id, payload_len));
                                     inner_recv.lock().unwrap()
                                         .pending_seq_ids.lock().unwrap()
                                         .push_back(parsed.seq_id);
+                                } else {
+                                    sdk_log(&inner_recv, &format!(
+                                        "[P2PSDK] recv → seqId=0, payload={} bytes",
+                                        payload_len));
                                 }
                                 fire_on_data(&inner_recv, parsed.payload);
+                            } else {
+                                sdk_log(&inner_recv, &format!(
+                                    "[P2PSDK] recv → unknown frame type=0x{:x}, {} bytes",
+                                    parsed.frame_type, app_data.len()));
                             }
+                        } else {
+                            sdk_log(&inner_recv, &format!(
+                                "[P2PSDK] recv → parse_frame failed, {} bytes raw",
+                                app_data.len()));
                         }
                     }
                 }
@@ -1251,6 +1277,19 @@ fn fire_on_data(inner: &Arc<Mutex<ClientInner>>, payload: Vec<u8>) {
     let guard = inner.lock().unwrap();
     if let Some(ref cb) = guard.on_data {
         cb(payload);
+    }
+}
+
+fn sdk_log(inner: &Arc<Mutex<ClientInner>>, msg: &str) {
+    let cb = {
+        let mut guard = inner.lock().unwrap();
+        guard.on_log.take()
+    };
+    if let Some(ref cb) = cb {
+        cb(msg);
+    }
+    if cb.is_some() {
+        inner.lock().unwrap().on_log = cb;
     }
 }
 

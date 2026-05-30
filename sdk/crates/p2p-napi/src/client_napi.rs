@@ -229,13 +229,14 @@ pub fn stop_ice() -> i32 {
 }
 
 pub fn send_data(data: &[u8]) -> i32 {
+    hilog::log_info(&format!("[P2PSDK] sendData → {} bytes", data.len()));
     let guard = get_inner().lock().unwrap();
 
     // Try P2pClient first (connect flow)
     if guard.p2p_client.is_ice_completed() {
         return match guard.p2p_client.send_data(data) {
             Ok(()) => 0,
-            Err(e) => { hilog::log_error(&format!("sendData: {e}")); -1 }
+            Err(e) => { hilog::log_error(&format!("[P2PSDK] sendData error: {e}")); -1 }
         };
     }
 
@@ -243,11 +244,10 @@ pub fn send_data(data: &[u8]) -> i32 {
     let (action, udp) = {
         let agent = match guard.ice_agent.as_ref() {
             Some(a) => a,
-            None => { hilog::log_error("sendData: no ICE agent"); return -2; }
-        };
+            None => { hilog::log_error("[P2PSDK] sendData: no ICE agent"); return -2; }        };
         let udp = match guard.ice_udp.as_ref() {
             Some(u) => u.clone(),
-            None => { hilog::log_error("sendData: no UDP socket"); return -3; }
+            None => { hilog::log_error("[P2PSDK] sendData: no UDP socket"); return -3; }
         };
         (agent.send_data(data), udp)
     };
@@ -263,14 +263,17 @@ pub fn send_text(text: &str) -> i32 {
 
     // Try P2pClient first (connect flow)
     if guard.p2p_client.is_ice_completed() {
+        // P2pClient.send_text logs internally via on_log callback
         return match guard.p2p_client.send_text(text) {
             Ok(()) => 0,
-            Err(e) => { hilog::log_error(&format!("sendText: {e}")); -1 }
+            Err(e) => { hilog::log_error(&format!("[P2PSDK] sendText error: {e}")); -1 }
         };
     }
 
     // Fall back to Inner's ice_agent (connector ICE)
     let seq_id = guard.pending_seq_ids.lock().unwrap().pop_front().unwrap_or(0);
+    hilog::log_info(&format!(
+        "[P2PSDK] sendText → seqId={}, text=\"{}\" (connector path)", seq_id, text));
     let frame = if seq_id > 0 {
         encode_data_frame_with_seq(text, seq_id)
     } else {
@@ -359,7 +362,11 @@ pub fn connect(peer_id: &str, odid: &str, is_device: bool, heartbeat_interval: u
         napi_bridge::fire_state(&state_str);
     }));
     guard.p2p_client.on_data(Box::new(|data: Vec<u8>| {
+        hilog::log_info(&format!("[P2PSDK] onData → {} bytes to ArkTS", data.len()));
         napi_bridge::fire_data(&data);
+    }));
+    guard.p2p_client.on_log(Box::new(|msg: &str| {
+        hilog::log_info(msg);
     }));
 
     // Delegate to P2pClient::connect() (token generated internally)
@@ -848,12 +855,23 @@ fn start_ice_threads_inner(inner: &Arc<Mutex<Inner>>) {
                         // Extract seqId from data frame for automatic response correlation
                         if let Some(parsed) = parse_frame(&app_data) {
                             if parsed.frame_type == TYPE_DATA && parsed.seq_id > 0 {
+                                hilog::log_info(&format!(
+                                    "[P2PSDK] recv → seqId={}, payload={} bytes (connector path)",
+                                    parsed.seq_id, parsed.payload.len()));
                                 inner_recv.lock().unwrap()
                                     .pending_seq_ids.lock().unwrap()
                                     .push_back(parsed.seq_id);
+                            } else if parsed.frame_type == TYPE_DATA {
+                                hilog::log_info(&format!(
+                                    "[P2PSDK] recv → seqId=0, payload={} bytes (connector path)",
+                                    parsed.payload.len()));
                             }
+                        } else {
+                            hilog::log_info(&format!(
+                                "[P2PSDK] recv → parse_frame failed, {} bytes (connector path)",
+                                app_data.len()));
                         }
-                        hilog::log_info(&format!("ICE app data: {} bytes", app_data.len()));
+                        hilog::log_info(&format!("[P2PSDK] onData → {} bytes to ArkTS (connector path)", app_data.len()));
                         napi_bridge::fire_data(&app_data);
                     }
                 }
